@@ -77,3 +77,7 @@ Model presets live in `src/data/models.ts`, GPUs in `src/data/gpus.ts`, and
 every formula in `src/engine/` has a corresponding test in
 `src/engine/engine.test.ts`. PRs that add models/GPUs or tighten a formula
 against measured numbers are very welcome.
+
+## License
+
+[Apache-2.0](LICENSE)
