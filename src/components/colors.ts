@@ -13,3 +13,17 @@ export const COMPONENT_COLORS: Record<MemoryComponent['id'], string> = {
   optimizer: 'var(--c-opt)',
   overhead: 'var(--c-ovh)',
 }
+
+/**
+ * Ink for the gauge's on-stratum labels. Most strata are light enough in
+ * both themes for the shared near-black ink; the gradients stratum flips
+ * per theme (light-theme violet #4a3aa7 is dark — black ink is ~2.4:1).
+ */
+export const COMPONENT_LABEL_INK: Record<MemoryComponent['id'], string> = {
+  weights: 'var(--gauge-label-ink)',
+  kvCache: 'var(--gauge-label-ink)',
+  activations: 'var(--gauge-label-ink)',
+  gradients: 'var(--gauge-label-ink-grad)',
+  optimizer: 'var(--gauge-label-ink-opt)',
+  overhead: 'var(--gauge-label-ink)',
+}

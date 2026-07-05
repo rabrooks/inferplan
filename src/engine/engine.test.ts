@@ -5,6 +5,14 @@ import { GiB, estimateInference, kvBytesPerToken } from './inference'
 import { solveMaxTokens } from './fit'
 import { kvFormat, weightFormat } from './precision'
 import { estimateParams, parseHFConfig } from './hf'
+import {
+  estimateTraining,
+  minGpusToTrain,
+  solveTrainingLimits,
+  trainingActivationBytes,
+  trainingBytesPerParam,
+  type TrainingConfig,
+} from './training'
 import type { ModelArchitecture } from './types'
 
 const model = (name: string): ModelArchitecture => {
@@ -138,6 +146,137 @@ describe('fit and inverse solver', () => {
       singleGpu,
     )
     expect(over.totalBytesPerGpu).toBeGreaterThan(h100.vramGiB * GiB * 0.9)
+  })
+})
+
+describe('training states', () => {
+  const mixedAdamW: TrainingConfig = {
+    optimizer: 'adamw',
+    precision: 'mixed-bf16',
+    zeroStage: 0,
+    checkpointing: 'selective',
+  }
+  const ddp1 = { tensorParallel: 1, pipelineParallel: 1, replicas: 1 }
+  const bytesOf = (est: ReturnType<typeof estimateTraining>, id: string) =>
+    est.components.find((c) => c.id === id)!.bytesPerGpu
+
+  it('mixed-precision AdamW is 16 B/param: bf16 weights 2 + bf16 grads 2 + fp32 master 4 + m/v 8 (transformer-math)', () => {
+    const per = trainingBytesPerParam(mixedAdamW)
+    expect(per.weights + per.gradients + per.optimizer).toBe(16)
+    const m = model('Llama 3.1 8B')
+    const est = estimateTraining(m, mixedAdamW, { sequenceLength: 1, microBatchSize: 1 }, ddp1)
+    expect(bytesOf(est, 'weights')).toBe(2 * m.paramsTotal)
+    expect(bytesOf(est, 'gradients')).toBe(2 * m.paramsTotal)
+    expect(bytesOf(est, 'optimizer')).toBe(12 * m.paramsTotal)
+  })
+
+  it('8-bit AdamW optimizer states are 6 B/param, SGD+momentum 8 B/param (bitsandbytes / transformer-math)', () => {
+    expect(trainingBytesPerParam({ ...mixedAdamW, optimizer: 'adamw-8bit' }).optimizer).toBe(6)
+    expect(trainingBytesPerParam({ ...mixedAdamW, optimizer: 'sgd' }).optimizer).toBe(8)
+  })
+
+  it('fp32 AdamW is also 16 B/param, with no separate master copy: 4 + 4 + 8', () => {
+    const per = trainingBytesPerParam({ ...mixedAdamW, precision: 'fp32' })
+    expect(per).toEqual({ weights: 4, gradients: 4, optimizer: 8 })
+  })
+
+  it('ZeRO stages shard optimizer, then gradients, then parameters across DP ranks', () => {
+    const m = model('Llama 3.1 8B')
+    const w = { sequenceLength: 1, microBatchSize: 1 }
+    const dp8 = { tensorParallel: 1, pipelineParallel: 1, replicas: 8 }
+    const z1 = estimateTraining(m, { ...mixedAdamW, zeroStage: 1 }, w, dp8)
+    expect(bytesOf(z1, 'optimizer')).toBe((12 * m.paramsTotal) / 8)
+    expect(bytesOf(z1, 'gradients')).toBe(2 * m.paramsTotal)
+    expect(bytesOf(z1, 'weights')).toBe(2 * m.paramsTotal)
+    const z2 = estimateTraining(m, { ...mixedAdamW, zeroStage: 2 }, w, dp8)
+    expect(bytesOf(z2, 'gradients')).toBe((2 * m.paramsTotal) / 8)
+    expect(bytesOf(z2, 'weights')).toBe(2 * m.paramsTotal)
+    const z3 = estimateTraining(m, { ...mixedAdamW, zeroStage: 3 }, w, dp8)
+    expect(bytesOf(z3, 'weights')).toBe((2 * m.paramsTotal) / 8)
+    expect(bytesOf(z3, 'gradients')).toBe((2 * m.paramsTotal) / 8)
+    expect(bytesOf(z3, 'optimizer')).toBe((12 * m.paramsTotal) / 8)
+  })
+
+  it('warns when ZeRO is enabled on a single GPU, and for MoE models', () => {
+    const w = { sequenceLength: 1, microBatchSize: 1 }
+    const z3 = estimateTraining(model('Llama 3.1 8B'), { ...mixedAdamW, zeroStage: 3 }, w, ddp1)
+    expect(z3.warnings.some((x) => x.includes('single GPU'))).toBe(true)
+    const moe = estimateTraining(model('Mixtral 8x7B'), mixedAdamW, w, ddp1)
+    expect(moe.warnings.some((x) => x.includes('MoE'))).toBe(true)
+  })
+})
+
+describe('training activations', () => {
+  const base: TrainingConfig = { optimizer: 'adamw', precision: 'mixed-bf16', zeroStage: 0, checkpointing: 'none' }
+
+  it('no recomputation matches Korthikanti/transformer-math sbhL(34 + 5as/h) at TP=1', () => {
+    const m = model('Llama 3.1 8B') // h=4096, L=32, a=32
+    const w = { sequenceLength: 4096, microBatchSize: 1 }
+    // factor = 34 + 5·32·4096/4096 = 194; sbhL = 4096·1·4096·32
+    expect(trainingActivationBytes(m, w, base)).toBe(4096 * 4096 * 32 * 194)
+  })
+
+  it('selective recomputation keeps 34·sbhL; full checkpointing keeps 2·sbhL', () => {
+    const m = model('Llama 3.1 8B')
+    const w = { sequenceLength: 4096, microBatchSize: 1 }
+    const sbhL = 4096 * 1 * 4096 * 32
+    expect(trainingActivationBytes(m, w, { ...base, checkpointing: 'selective' })).toBe(34 * sbhL)
+    expect(trainingActivationBytes(m, w, { ...base, checkpointing: 'full' })).toBe(2 * sbhL)
+  })
+
+  it('scales linearly with micro-batch and doubles under fp32', () => {
+    const m = model('Llama 3.1 8B')
+    const w = { sequenceLength: 2048, microBatchSize: 1 }
+    expect(trainingActivationBytes(m, { ...w, microBatchSize: 4 }, base)).toBe(4 * trainingActivationBytes(m, w, base))
+    expect(trainingActivationBytes(m, w, { ...base, precision: 'fp32' })).toBe(2 * trainingActivationBytes(m, w, base))
+  })
+})
+
+describe('training fit and limits', () => {
+  const cfg: TrainingConfig = { optimizer: 'adamw', precision: 'mixed-bf16', zeroStage: 3, checkpointing: 'full' }
+
+  it('Llama 3.1 8B mixed AdamW ZeRO-3 needs 4× A100-40 (16 B/param states sharded)', () => {
+    const fit = minGpusToTrain(model('Llama 3.1 8B'), cfg, { sequenceLength: 4096, microBatchSize: 1 }, gpu('a100-40'))
+    expect(fit?.count).toBe(4)
+  })
+
+  it('plain DDP cannot fit by adding GPUs — nothing shards', () => {
+    const fit = minGpusToTrain(
+      model('Llama 3.3 70B'),
+      { ...cfg, zeroStage: 0 },
+      { sequenceLength: 4096, microBatchSize: 1 },
+      gpu('h100-sxm'),
+    )
+    expect(fit).toBeNull()
+  })
+
+  it('solver micro-batch limit is consistent with the forward estimate', () => {
+    const m = model('Llama 3.1 8B')
+    const w = { sequenceLength: 4096, microBatchSize: 1 }
+    const h100 = gpu('h100-sxm')
+    const dp8 = { tensorParallel: 1, pipelineParallel: 1, replicas: 8 }
+    const usable = h100.vramGiB * GiB * 0.9
+    const { maxMicroBatch } = solveTrainingLimits(m, cfg, w, h100, 8)
+    expect(maxMicroBatch).toBeGreaterThan(0)
+    const atMax = estimateTraining(m, cfg, { ...w, microBatchSize: maxMicroBatch }, dp8)
+    expect(atMax.totalBytesPerGpu).toBeLessThanOrEqual(usable)
+    const over = estimateTraining(m, cfg, { ...w, microBatchSize: maxMicroBatch + 1 }, dp8)
+    expect(over.totalBytesPerGpu).toBeGreaterThan(usable)
+  })
+
+  it('solver sequence-length limit is consistent with the forward estimate (quadratic regime)', () => {
+    const m = model('Llama 3.1 8B')
+    const noCkpt: TrainingConfig = { ...cfg, checkpointing: 'none' }
+    const w = { sequenceLength: 4096, microBatchSize: 1 }
+    const h100 = gpu('h100-sxm')
+    const dp8 = { tensorParallel: 1, pipelineParallel: 1, replicas: 8 }
+    const usable = h100.vramGiB * GiB * 0.9
+    const { maxSequenceLength } = solveTrainingLimits(m, noCkpt, w, h100, 8)
+    expect(maxSequenceLength).toBeGreaterThan(0)
+    const atMax = estimateTraining(m, noCkpt, { sequenceLength: maxSequenceLength, microBatchSize: 1 }, dp8)
+    expect(atMax.totalBytesPerGpu).toBeLessThanOrEqual(usable)
+    const over = estimateTraining(m, noCkpt, { sequenceLength: maxSequenceLength + 1, microBatchSize: 1 }, dp8)
+    expect(over.totalBytesPerGpu).toBeGreaterThan(usable)
   })
 })
 

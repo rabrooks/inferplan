@@ -38,6 +38,10 @@
 
   /* gauge ink/effects that sit ON colored strata, not on the surface */
   --gauge-label-ink: rgba(0, 0, 0, 0.78);
+  /* per-stratum overrides: dark-theme gradients violet #9085e9 is light, black ink holds (5.2:1);
+     the optimizer magenta #d55181 needs slightly heavier ink to clear 4.5:1 (0.78 → 4.35:1, 0.9 → 4.96:1) */
+  --gauge-label-ink-grad: rgba(0, 0, 0, 0.78);
+  --gauge-label-ink-opt: rgba(0, 0, 0, 0.9);
   --veil-hatch: rgba(208, 59, 59, 0.28);
   --shadow-pop: 0 4px 16px rgba(0, 0, 0, 0.5);
 
@@ -74,6 +78,9 @@
   --warning: #b77700;
 
   --gauge-label-ink: rgba(0, 0, 0, 0.92);
+  /* light-theme gradients violet #4a3aa7 is dark — black ink fails (2.37:1), white clears 7.9:1 */
+  --gauge-label-ink-grad: rgba(255, 255, 255, 0.95);
+  --gauge-label-ink-opt: rgba(0, 0, 0, 0.92);
   --veil-hatch: rgba(208, 59, 59, 0.35);
   --shadow-pop: 0 4px 16px rgba(11, 11, 11, 0.16);
 }
@@ -105,6 +112,8 @@
     --warning: #b77700;
 
     --gauge-label-ink: rgba(0, 0, 0, 0.92);
+    --gauge-label-ink-grad: rgba(255, 255, 255, 0.95);
+    --gauge-label-ink-opt: rgba(0, 0, 0, 0.92);
     --veil-hatch: rgba(208, 59, 59, 0.35);
     --shadow-pop: 0 4px 16px rgba(11, 11, 11, 0.16);
   }

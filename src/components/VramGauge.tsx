@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import type { MemoryComponent } from '../engine/types'
 import { GiB, fmtBytes } from '../engine/inference'
-import { COMPONENT_COLORS } from './colors'
+import { COMPONENT_COLORS, COMPONENT_LABEL_INK } from './colors'
 
 interface Props {
   components: MemoryComponent[]
@@ -71,7 +71,7 @@ export function VramGauge({ components, capacityGiB, memoryUtilization }: Props)
             onMouseLeave={() => setHover(null)}
           >
             {height > 5.5 && (
-              <span className="gauge-stratum-label">
+              <span className="gauge-stratum-label" style={{ color: COMPONENT_LABEL_INK[comp.id] }}>
                 {comp.label} · {fmtBytes(comp.bytesPerGpu)}
               </span>
             )}

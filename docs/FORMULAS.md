@@ -1,8 +1,11 @@
 # Memory formulas
 
-All estimates model a vLLM-style serving engine. Symbols: `P` total params,
+Inference estimates model a vLLM-style serving engine; training estimates
+model a DeepSpeed/FSDP-style data-parallel run. Symbols: `P` total params,
 `L` layers, `H_kv` KV heads, `d_h` head dim, `T` total tokens in KV cache
-(context length × concurrent sequences), `tp`/`pp` tensor/pipeline degree.
+(context length × concurrent sequences), `tp`/`pp` tensor/pipeline degree,
+`N` data-parallel world size, `s` sequence length, `b` micro-batch size,
+`h` hidden size, `a` attention heads.
 
 ## Weights
 
@@ -50,6 +53,53 @@ act_bytes ≈ min(T, 8192) × hidden_size × 6 × act_bits / 8
 QKV/attention-out/MLP buffers; `act_bits` is 16 unless the format quantizes
 activations (W8A8). This is an explicit heuristic — it is small relative to
 weights and KV, and labelled an estimate in the UI.
+
+## Training states
+
+Persistent per-parameter bytes, following EleutherAI's transformer-math and
+cross-checked against George614/gpu-mem-calculator:
+
+| Precision | Weights | Gradients | Optimizer states |
+|-----------|---------|-----------|------------------|
+| Mixed BF16 | 2 | 2 | fp32 master 4 + optimizer state |
+| FP32 | 4 | 4 | optimizer state only (weights are the master) |
+
+Optimizer state per param: AdamW = 8 (fp32 m+v), AdamW 8-bit = 2
+(bitsandbytes quantized m+v), SGD with momentum = 4. The mixed-precision
+AdamW total is the standard **16 B/param** (2 + 2 + 4 + 8): an 8B-param model
+carries ~128 GB of persistent state before activations.
+
+ZeRO sharding across `N` data-parallel ranks (stage 3 ≈ FSDP full-shard):
+
+```
+stage 1: optimizer / N
+stage 2: optimizer / N, gradients / N
+stage 3: optimizer / N, gradients / N, weights / N
+```
+
+Stage 0 (plain DDP) replicates everything, so adding GPUs never reduces
+per-GPU memory. Tensor/pipeline parallelism is not modeled for training yet.
+MoE models are simplified to dense (all experts resident, no expert
+parallelism) with a warning.
+
+## Activations (training)
+
+From Korthikanti et al., "Reducing Activation Recomputation in Large
+Transformer Models" (also transformer-math), at TP = 1, bytes per GPU:
+
+```
+no recomputation:  s·b·h·L·(34 + 5·a·s/h)
+selective:         s·b·h·L·34               (attention scores recomputed — what
+                                             FlashAttention avoids storing)
+full:              s·b·h·L·2                (only layer inputs retained)
+```
+
+Constants assume 2-byte activations (fp32 training doubles them) and a
+standard 4h MLP — SwiGLU models run slightly higher, and embedding/logit
+buffers are excluded, so training totals are labelled ±10%. The inverse
+solver subtracts the persistent states from usable VRAM and solves the
+remaining headroom for max micro-batch (linear) and max sequence length
+(binary search — quadratic in `s` without recomputation).
 
 ## Overhead and fit
 
