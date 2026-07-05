@@ -9,7 +9,7 @@ export const COMPONENT_COLORS: Record<MemoryComponent['id'], string> = {
   weights: 'var(--c-weights)',
   kvCache: 'var(--c-kv)',
   activations: 'var(--c-act)',
-  gradients: '#9085e9',
-  optimizer: '#d55181',
+  gradients: 'var(--c-grad)',
+  optimizer: 'var(--c-opt)',
   overhead: 'var(--c-ovh)',
 }

@@ -5,11 +5,15 @@
 
 /* ---------------------------------------------------------------------------
    InferPlan — GPU memory calculator
-   Dark "engineering instrument" theme. Chrome stays warm-neutral; color is
-   carried by the memory-component hues (validated for CVD on this surface).
+   "Engineering instrument" theme, dark by default (the brand). Chrome stays
+   warm-neutral in both themes; color is carried by the memory-component hues
+   (validated for CVD against each theme's surface with the dataviz palette
+   validator — sub-3:1 light slots rely on direct labels + breakdown table).
 --------------------------------------------------------------------------- */
 
 :root {
+  color-scheme: dark;
+
   --bg: #0d0d0d;
   --surface: #1a1a19;
   --surface-2: #222221;
@@ -24,19 +28,90 @@
   --c-kv: #199e70;
   --c-act: #c98500;
   --c-ovh: #6f6e68;
-  /* reserved for training phase: gradients #9085e9, optimizer #d55181 */
+  /* training phase (reserved, rendered once an estimator emits them) */
+  --c-grad: #9085e9;
+  --c-opt: #d55181;
 
   --critical: #d03b3b;
   --good: #0ca30c;
   --warning: #fab219;
 
+  /* gauge ink/effects that sit ON colored strata, not on the surface */
+  --gauge-label-ink: rgba(0, 0, 0, 0.78);
+  --veil-hatch: rgba(208, 59, 59, 0.28);
+  --shadow-pop: 0 4px 16px rgba(0, 0, 0, 0.5);
+
   --font-ui: 'Archivo Variable', system-ui, sans-serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
 }
 
+/* Light theme — stamped on <html> by the pre-paint script in index.html.
+   Keep in sync with the no-JS fallback media block below. Values from the
+   dataviz reference palette's light column; muted darkened to #74726b
+   (4.6:1) because this UI sets microcopy in it, label ink raised to 0.92
+   so it clears 4.5:1 on the light weights blue. */
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --bg: #f9f9f7;
+  --surface: #fcfcfb;
+  --surface-2: #f0efec;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #74726b;
+  --hairline: #e1e0d9;
+  --ring: rgba(11, 11, 11, 0.1);
+
+  --c-weights: #2a78d6;
+  --c-kv: #1baf7a;
+  --c-act: #eda100;
+  --c-ovh: #8a8880;
+  --c-grad: #4a3aa7;
+  --c-opt: #e87ba4;
+
+  --critical: #d03b3b;
+  --good: #006300;
+  --warning: #b77700;
+
+  --gauge-label-ink: rgba(0, 0, 0, 0.92);
+  --veil-hatch: rgba(208, 59, 59, 0.35);
+  --shadow-pop: 0 4px 16px rgba(11, 11, 11, 0.16);
+}
+
+/* No-JS fallback: honor the OS preference when the script hasn't stamped a
+   theme. Duplicate of :root[data-theme='light'] above — keep in sync. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    color-scheme: light;
+
+    --bg: #f9f9f7;
+    --surface: #fcfcfb;
+    --surface-2: #f0efec;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #74726b;
+    --hairline: #e1e0d9;
+    --ring: rgba(11, 11, 11, 0.1);
+
+    --c-weights: #2a78d6;
+    --c-kv: #1baf7a;
+    --c-act: #eda100;
+    --c-ovh: #8a8880;
+    --c-grad: #4a3aa7;
+    --c-opt: #e87ba4;
+
+    --critical: #d03b3b;
+    --good: #006300;
+    --warning: #b77700;
+
+    --gauge-label-ink: rgba(0, 0, 0, 0.92);
+    --veil-hatch: rgba(208, 59, 59, 0.35);
+    --shadow-pop: 0 4px 16px rgba(11, 11, 11, 0.16);
+  }
+}
+
 html {
   background: var(--bg);
-  color-scheme: dark;
 }
 
 body {
@@ -128,6 +203,21 @@ body {
   padding: 7px 12px;
 }
 .share-btn:hover {
+  border-color: var(--muted);
+  color: var(--ink);
+}
+
+.theme-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  color: var(--ink-2);
+}
+.theme-btn:hover {
   border-color: var(--muted);
   color: var(--ink);
 }
@@ -413,7 +503,7 @@ button:focus-visible {
 .gauge-stratum-label {
   font-family: var(--font-mono);
   font-size: 10.5px;
-  color: rgba(0, 0, 0, 0.78);
+  color: var(--gauge-label-ink);
   white-space: nowrap;
   overflow: hidden;
 }
@@ -429,7 +519,7 @@ button:focus-visible {
   left: 0;
   right: 0;
   z-index: 2;
-  background: repeating-linear-gradient(45deg, rgba(208, 59, 59, 0.28) 0 5px, transparent 5px 10px);
+  background: repeating-linear-gradient(45deg, var(--veil-hatch) 0 5px, transparent 5px 10px);
   border-bottom: 1px solid var(--critical);
 }
 .gauge-scale {
@@ -472,7 +562,7 @@ button:focus-visible {
   color: var(--ink-2);
   max-width: 240px;
   pointer-events: none;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-pop);
 }
 .gauge-tooltip .tt-title {
   color: var(--ink);

@@ -9,6 +9,24 @@
       name="description"
       content="Calculate GPU memory for LLM deployments: weights, KV cache, quantization, tensor parallelism, and which GPUs fit."
     />
+    <meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f9f9f7" media="(prefers-color-scheme: light)" />
+    <script>
+      // Stamp the theme before first paint: stored choice wins, else OS
+      // preference. Dark is the default and the brand.
+      ;(function () {
+        var theme = null
+        try {
+          theme = localStorage.getItem('inferplan-theme')
+        } catch (e) {
+          /* storage blocked — fall through to OS preference */
+        }
+        if (theme !== 'light' && theme !== 'dark') {
+          theme = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+        }
+        document.documentElement.dataset.theme = theme
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

@@ -9,11 +9,58 @@ import { VramGauge } from './components/VramGauge'
 import { BreakdownTable } from './components/BreakdownTable'
 import { FitGrid } from './components/FitGrid'
 
+type Theme = 'dark' | 'light'
+
+/**
+ * Theme is a viewer preference, not part of a configuration — it lives in
+ * localStorage, never in the shareable URL. The pre-paint script in
+ * index.html stamps data-theme on <html> before React mounts; this hook
+ * reads that, flips it on toggle, and follows OS changes until the viewer
+ * makes an explicit choice.
+ */
+function useTheme() {
+  const [theme, setTheme] = useState<Theme>(() =>
+    typeof document !== 'undefined' && document.documentElement.dataset.theme === 'light' ? 'light' : 'dark',
+  )
+
+  useEffect(() => {
+    const mq = window.matchMedia('(prefers-color-scheme: light)')
+    const followOs = () => {
+      try {
+        if (localStorage.getItem('inferplan-theme')) return
+      } catch {
+        /* storage blocked — keep following the OS */
+      }
+      const next: Theme = mq.matches ? 'light' : 'dark'
+      document.documentElement.dataset.theme = next
+      setTheme(next)
+    }
+    mq.addEventListener('change', followOs)
+    return () => mq.removeEventListener('change', followOs)
+  }, [])
+
+  const toggle = () => {
+    setTheme((prev) => {
+      const next: Theme = prev === 'dark' ? 'light' : 'dark'
+      document.documentElement.dataset.theme = next
+      try {
+        localStorage.setItem('inferplan-theme', next)
+      } catch {
+        /* storage blocked — theme still applies for this visit */
+      }
+      return next
+    })
+  }
+
+  return { theme, toggle }
+}
+
 export default function App() {
   const [state, setState] = useState<CalculatorState>(() =>
     typeof window === 'undefined' ? DEFAULT_STATE : stateFromParams(new URLSearchParams(window.location.search)),
   )
   const [copied, setCopied] = useState(false)
+  const { theme, toggle } = useTheme()
 
   const update = (patch: Partial<CalculatorState>) => setState((s) => ({ ...s, ...patch }))
 
@@ -67,6 +114,23 @@ export default function App() {
         </nav>
         <button className="share-btn" onClick={share}>
           {copied ? 'LINK COPIED' : 'SHARE CONFIG'}
+        </button>
+        <button
+          className="theme-btn"
+          onClick={toggle}
+          aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+          title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+        >
+          {theme === 'dark' ? (
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="4.5" />
+              <path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M18.7 5.3l-2.1 2.1M7.4 16.6l-2.1 2.1" />
+            </svg>
+          ) : (
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z" />
+            </svg>
+          )}
         </button>
       </header>
 
