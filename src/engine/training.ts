@@ -12,11 +12,28 @@ export type ZeroStage = 0 | 1 | 2 | 3
  */
 export type ActivationCheckpointing = 'none' | 'selective' | 'full'
 
+export type FinetuneMethod = 'full' | 'lora' | 'qlora'
+/**
+ * Which projections carry LoRA adapters. 'attn-qv' is the LoRA paper's
+ * GPT-3 setup (Hu et al. 2021) and the PEFT default for Llama-family
+ * models; 'all-linear' is the QLoRA recipe — Dettmers et al. found
+ * adapters on every linear layer are needed to match full fine-tuning.
+ */
+export type LoraTargets = 'attn-qv' | 'attn-all' | 'all-linear'
+
+export interface FinetuneConfig {
+  method: FinetuneMethod
+  loraRank: number
+  loraTargets: LoraTargets
+}
+
 export interface TrainingConfig {
   optimizer: TrainingOptimizer
   precision: TrainingPrecision
   zeroStage: ZeroStage
   checkpointing: ActivationCheckpointing
+  /** Absent (or method 'full') means full fine-tuning / pre-training. */
+  finetune?: FinetuneConfig
 }
 
 export interface TrainingWorkload {
@@ -31,6 +48,57 @@ export const ZERO_STAGE_NOTES: Record<ZeroStage, string> = {
   1: 'optimizer states sharded across ranks',
   2: 'optimizer + gradients sharded',
   3: 'optimizer + gradients + parameters sharded (≈ FSDP full-shard)',
+}
+
+/**
+ * Effective bits per parameter of a QLoRA base model: 4-bit NF4 weights,
+ * block-64 fp32 quantization scales double-quantized to fp8 with fp32
+ * constants per 256 blocks — 4 + 8/64 + 32/(64·256) ≈ 4.127 bits
+ * (Dettmers et al., QLoRA §3: DQ cuts scale overhead from 0.5 to 0.127
+ * bits/param, ~3 GB on a 65B model). Embeddings and lm_head stay 16-bit
+ * in practice; treating them as quantized underestimates by <2%.
+ */
+export const QLORA_BASE_BITS_PER_PARAM = 4 + 8 / 64 + 32 / (64 * 256)
+
+export const LORA_TARGET_LABELS: Record<LoraTargets, string> = {
+  'attn-qv': 'attention Q + V',
+  'attn-all': 'all attention (Q, K, V, O)',
+  'all-linear': 'all linear layers',
+}
+
+/**
+ * Trainable adapter parameters: each targeted projection W ∈ R^(d_in×d_out)
+ * gains rank-r factors of r·(d_in + d_out) params, summed over layers.
+ * GQA-aware (K/V project to numKVHeads·headDim); for MoE models the MLP
+ * targets count every expert's projections.
+ */
+export function loraAdapterParams(model: ModelArchitecture, rank: number, targets: LoraTargets): number {
+  const h = model.hiddenSize
+  const attnDim = model.numAttentionHeads * model.headDim
+  const kvDim = model.numKVHeads * model.headDim
+  let perLayer = (h + attnDim) + (h + kvDim) // Q and V
+  if (targets !== 'attn-qv') perLayer += (h + kvDim) + (attnDim + h) // K and O
+  if (targets === 'all-linear') {
+    const ffn = model.moe ? model.moe.expertIntermediateSize : model.intermediateSize
+    const experts = model.moe ? model.moe.numExperts : 1
+    perLayer += experts * 3 * (h + ffn) // gate, up, down (d_in+d_out is symmetric)
+  }
+  return rank * perLayer * model.numLayers
+}
+
+/**
+ * Fixed per-GPU overhead. QLoRA adds a transient dequantization buffer:
+ * bitsandbytes dequantizes each NF4 tensor to bf16 for its matmul
+ * (QLoRA §3), so the peak holds the largest linear layer in bf16.
+ */
+export function trainingOverheadBytes(model: ModelArchitecture, config: TrainingConfig): number {
+  if (config.finetune?.method !== 'qlora') return FRAMEWORK_OVERHEAD_BYTES
+  const h = model.hiddenSize
+  const largestLinear = Math.max(
+    h * model.numAttentionHeads * model.headDim,
+    h * (model.moe ? model.moe.expertIntermediateSize : model.intermediateSize),
+  )
+  return FRAMEWORK_OVERHEAD_BYTES + 2 * largestLinear
 }
 
 /**
@@ -86,7 +154,13 @@ export function trainingActivationBytes(
   return s * b * h * L * perLayerFactor * precisionScale
 }
 
-/** Per-GPU bytes of the persistent states after ZeRO sharding across `dp` ranks. */
+/**
+ * Per-GPU bytes of the persistent states after ZeRO sharding across `dp`
+ * ranks. With LoRA/QLoRA the base weights are frozen — they still occupy
+ * memory (bf16, or NF4 for QLoRA) but only the adapter parameters carry
+ * gradients and optimizer states. ZeRO/FSDP shards frozen params too, so
+ * the stage rules are unchanged.
+ */
 export function trainingStateBytesPerGpu(
   model: ModelArchitecture,
   config: TrainingConfig,
@@ -94,10 +168,19 @@ export function trainingStateBytesPerGpu(
 ): { weights: number; gradients: number; optimizer: number } {
   const per = trainingBytesPerParam(config)
   const P = model.paramsTotal
+  const ft = config.finetune
+  let weightBytes = P * per.weights
+  let trainable = P
+  if (ft && ft.method !== 'full') {
+    const adapter = loraAdapterParams(model, ft.loraRank, ft.loraTargets)
+    const baseBytesPerParam = ft.method === 'qlora' ? QLORA_BASE_BITS_PER_PARAM / 8 : per.weights
+    weightBytes = P * baseBytesPerParam + adapter * per.weights
+    trainable = adapter
+  }
   return {
-    weights: (P * per.weights) / (config.zeroStage >= 3 ? dp : 1),
-    gradients: (P * per.gradients) / (config.zeroStage >= 2 ? dp : 1),
-    optimizer: (P * per.optimizer) / (config.zeroStage >= 1 ? dp : 1),
+    weights: weightBytes / (config.zeroStage >= 3 ? dp : 1),
+    gradients: (trainable * per.gradients) / (config.zeroStage >= 2 ? dp : 1),
+    optimizer: (trainable * per.optimizer) / (config.zeroStage >= 1 ? dp : 1),
   }
 }
 
@@ -134,10 +217,21 @@ export function estimateTraining(
   if (config.zeroStage > 0 && dp === 1) {
     warnings.push(`ZeRO-${config.zeroStage} shards across data-parallel ranks — with a single GPU it changes nothing.`)
   }
+  const ft = config.finetune && config.finetune.method !== 'full' ? config.finetune : undefined
+  if (ft && model.attentionType === 'mla') {
+    warnings.push(
+      'Adapter sizing assumes standard Q/K/V/O projections; MLA models factorize attention differently, so the adapter count is approximate.',
+    )
+  }
+  if (ft?.method === 'qlora' && config.precision === 'fp32') {
+    warnings.push('QLoRA computes in bf16 — FP32 here only inflates adapter states and activations beyond practice.')
+  }
 
   const per = trainingBytesPerParam(config)
   const state = trainingStateBytesPerGpu(model, config, dp)
   const actPerGpu = trainingActivationBytes(model, workload, config)
+  const adapterParams = ft ? loraAdapterParams(model, ft.loraRank, ft.loraTargets) : 0
+  const overheadBytes = trainingOverheadBytes(model, config)
   const mixed = config.precision === 'mixed-bf16'
   const shardNote = (stage: ZeroStage) => (config.zeroStage >= stage && dp > 1 ? ` ÷ ${dp} ranks (ZeRO-${config.zeroStage})` : '')
 
@@ -157,7 +251,11 @@ export function estimateTraining(
       id: 'weights',
       label: 'Model weights',
       bytesPerGpu: state.weights,
-      detail: `${fmtParams(model.paramsTotal)} params × ${per.weights} B (${mixed ? 'bf16' : 'fp32'})${shardNote(3)}`,
+      detail: ft
+        ? `${fmtParams(model.paramsTotal)} frozen base × ${
+            ft.method === 'qlora' ? `${QLORA_BASE_BITS_PER_PARAM.toFixed(2)} bits (NF4 + double quant)` : `${per.weights} B (${mixed ? 'bf16' : 'fp32'})`
+          } + ${fmtParams(adapterParams)} adapter × ${per.weights} B${shardNote(3)}`
+        : `${fmtParams(model.paramsTotal)} params × ${per.weights} B (${mixed ? 'bf16' : 'fp32'})${shardNote(3)}`,
     },
     {
       id: 'optimizer',
@@ -165,25 +263,33 @@ export function estimateTraining(
       bytesPerGpu: state.optimizer,
       detail: `${OPTIMIZER_LABELS[config.optimizer]}: ${mixed ? 'fp32 master 4 B + ' : ''}${
         config.optimizer === 'adamw' ? 'fp32 m+v 8 B' : config.optimizer === 'adamw-8bit' ? '8-bit m+v 2 B' : 'fp32 momentum 4 B'
-      } per param${shardNote(1)}`,
+      } per param${ft ? ` on ${fmtParams(adapterParams)} adapter params only` : ''}${shardNote(1)}${
+        ft?.method === 'qlora' ? ' — bitsandbytes paged, spikes spill to CPU' : ''
+      }`,
     },
     {
       id: 'gradients',
       label: 'Gradients',
       bytesPerGpu: state.gradients,
-      detail: `${fmtParams(model.paramsTotal)} params × ${per.gradients} B (${mixed ? 'bf16' : 'fp32'})${shardNote(2)}`,
+      detail: ft
+        ? `${fmtParams(adapterParams)} adapter params × ${per.gradients} B (${mixed ? 'bf16' : 'fp32'}) — frozen base carries none${shardNote(2)}`
+        : `${fmtParams(model.paramsTotal)} params × ${per.gradients} B (${mixed ? 'bf16' : 'fp32'})${shardNote(2)}`,
     },
     {
       id: 'activations',
       label: 'Activations (peak, est.)',
       bytesPerGpu: actPerGpu,
-      detail: `${workload.sequenceLength.toLocaleString()} tokens × micro-batch ${workload.microBatchSize} × ${model.numLayers} layers — ${ckptLabel}`,
+      detail: `${workload.sequenceLength.toLocaleString()} tokens × micro-batch ${workload.microBatchSize} × ${model.numLayers} layers — ${ckptLabel}${
+        ft ? ' (frozen base still runs forward/backward)' : ''
+      }`,
     },
     {
       id: 'overhead',
       label: 'Framework overhead',
-      bytesPerGpu: FRAMEWORK_OVERHEAD_BYTES,
-      detail: 'CUDA context, NCCL, allocator bookkeeping (~0.75 GiB/GPU)',
+      bytesPerGpu: overheadBytes,
+      detail: `CUDA context, NCCL, allocator bookkeeping (~0.75 GiB/GPU)${
+        ft?.method === 'qlora' ? ' + bf16 dequant buffer for the largest NF4 layer' : ''
+      }`,
     },
   ]
 
@@ -212,7 +318,7 @@ export function solveTrainingLimits(
 ): { freeForActivations: number; maxMicroBatch: number; maxSequenceLength: number } {
   const state = trainingStateBytesPerGpu(model, config, Math.max(1, dp))
   const usable = gpu.vramGiB * GiB * memoryUtilization
-  const free = usable - state.weights - state.gradients - state.optimizer - FRAMEWORK_OVERHEAD_BYTES
+  const free = usable - state.weights - state.gradients - state.optimizer - trainingOverheadBytes(model, config)
   if (free <= 0) return { freeForActivations: 0, maxMicroBatch: 0, maxSequenceLength: 0 }
 
   const perSequence = trainingActivationBytes(model, { ...workload, microBatchSize: 1 }, config)

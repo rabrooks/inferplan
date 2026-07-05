@@ -92,6 +92,7 @@ export default function App() {
     precision: state.trainPrecision,
     zeroStage: state.zeroStage,
     checkpointing: state.checkpointing,
+    finetune: { method: state.ftMethod, loraRank: state.loraRank, loraTargets: state.loraTargets },
   }
   const trainWorkload: TrainingWorkload = { sequenceLength: state.contextLength, microBatchSize: state.microBatch }
 
@@ -224,7 +225,13 @@ export default function App() {
             <div className="verdict-sub">
               {fmtBytes(estimate.totalBytesPerGpu)} of {fmtBytes(usableBytes)} usable per GPU · {model.name} ·{' '}
               {training
-                ? `${state.trainPrecision === 'mixed-bf16' ? 'mixed BF16' : 'FP32'} · ${
+                ? `${
+                    state.ftMethod === 'full'
+                      ? state.trainPrecision === 'mixed-bf16'
+                        ? 'mixed BF16'
+                        : 'FP32'
+                      : `${state.ftMethod === 'lora' ? 'LoRA' : 'QLoRA'} r=${state.loraRank}`
+                  } · ${
                     state.optimizer === 'adamw' ? 'AdamW' : state.optimizer === 'adamw-8bit' ? 'AdamW 8-bit' : 'SGD'
                   } · ${shardLabel}`
                 : `${quant.weights.label} weights`}

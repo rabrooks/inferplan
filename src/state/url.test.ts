@@ -45,6 +45,27 @@ describe('URL round-trip', () => {
     expect(parsed.gpuId).toBe('h200')
   })
 
+  it('fine-tuning state round-trips; full FT keeps the URL free of ft params', () => {
+    const state: CalculatorState = {
+      ...DEFAULT_STATE,
+      scenario: 'training',
+      ftMethod: 'qlora',
+      loraRank: 64,
+      loraTargets: 'all-linear',
+      optimizer: 'adamw-8bit',
+    }
+    const p = stateToParams(state)
+    expect(p.get('ft')).toBe('qlora')
+    const parsed = stateFromParams(p)
+    expect(parsed.ftMethod).toBe('qlora')
+    expect(parsed.loraRank).toBe(64)
+    expect(parsed.loraTargets).toBe('all-linear')
+    const fullFt = stateToParams({ ...state, ftMethod: 'full' })
+    expect(fullFt.get('ft')).toBeNull()
+    expect(fullFt.get('rank')).toBeNull()
+    expect(stateFromParams(fullFt).ftMethod).toBe('full')
+  })
+
   it('a pre-training-release inference URL still parses (defaults fill the new fields)', () => {
     const p = new URLSearchParams('model=Llama+3.1+8B&w=bf16&kv=fp16&ctx=8192&seqs=8&tp=1&pp=1&gpu=h100-sxm')
     const s = stateFromParams(p)
@@ -54,11 +75,14 @@ describe('URL round-trip', () => {
   })
 
   it('rejects garbage enum values instead of propagating them', () => {
-    const p = new URLSearchParams('sc=training&opt=evil&tprec=fp64&zero=9&ckpt=maybe')
+    const p = new URLSearchParams('sc=training&opt=evil&tprec=fp64&zero=9&ckpt=maybe&ft=dora&rank=-3&targ=everything')
     const s = stateFromParams(p)
     expect(s.optimizer).toBe(DEFAULT_STATE.optimizer)
     expect(s.trainPrecision).toBe(DEFAULT_STATE.trainPrecision)
     expect(s.zeroStage).toBe(DEFAULT_STATE.zeroStage)
     expect(s.checkpointing).toBe(DEFAULT_STATE.checkpointing)
+    expect(s.ftMethod).toBe('full')
+    expect(s.loraRank).toBe(DEFAULT_STATE.loraRank)
+    expect(s.loraTargets).toBe(DEFAULT_STATE.loraTargets)
   })
 })

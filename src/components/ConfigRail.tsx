@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { fetchHFModel } from '../engine/hf'
 import { fmtParams } from '../engine/inference'
 import { KV_FORMATS, WEIGHT_FORMATS, weightFormat } from '../engine/precision'
-import { ZERO_STAGE_NOTES, type ZeroStage } from '../engine/training'
+import { ZERO_STAGE_NOTES, loraAdapterParams, type FinetuneMethod, type ZeroStage } from '../engine/training'
 import type { ModelArchitecture } from '../engine/types'
 import { MODEL_PRESETS } from '../data/models'
 import type { CalculatorState } from '../state/url'
@@ -27,6 +27,20 @@ const CKPT_NOTES = {
   selective: 'attention scores recomputed (what FlashAttention gives for free)',
   full: 'only layer inputs retained; ~30% extra compute per step',
 } as const
+
+const LORA_RANK_PRESETS = [8, 16, 32, 64]
+
+const FT_NOTES: Record<FinetuneMethod, string> = {
+  full: 'every parameter carries gradients and optimizer states',
+  lora: 'frozen bf16 base; only low-rank adapters train',
+  qlora: 'frozen NF4 4-bit base + adapters (Dettmers et al.)',
+}
+
+const TARGET_OPTIONS = [
+  { id: 'attn-qv', label: 'Attention Q + V — LoRA paper default' },
+  { id: 'attn-all', label: 'All attention — Q, K, V, O' },
+  { id: 'all-linear', label: 'All linear layers — QLoRA recipe' },
+] as const
 
 export function ConfigRail({ state, model, update }: Props) {
   const [hfInput, setHfInput] = useState('')
@@ -117,6 +131,72 @@ export function ConfigRail({ state, model, update }: Props) {
         <section className="section">
           <div className="eyebrow">TRAINING</div>
           <div className="field">
+            <span className="field-label">Method</span>
+            <div className="seg" role="group" aria-label="Fine-tuning method">
+              {(['full', 'lora', 'qlora'] as const).map((v) => (
+                <button
+                  key={v}
+                  aria-pressed={state.ftMethod === v}
+                  onClick={() =>
+                    update(v === 'qlora' ? { ftMethod: v, trainPrecision: 'mixed-bf16' } : { ftMethod: v })
+                  }
+                >
+                  {v === 'full' ? 'Full FT' : v === 'lora' ? 'LoRA' : 'QLoRA'}
+                </button>
+              ))}
+            </div>
+            <div className="quant-note">{FT_NOTES[state.ftMethod]}</div>
+          </div>
+          {state.ftMethod !== 'full' && (
+            <>
+              <div className="field">
+                <label className="field-label" htmlFor="lora-rank">
+                  Adapter rank (r)
+                </label>
+                <input
+                  id="lora-rank"
+                  type="number"
+                  min={1}
+                  value={state.loraRank}
+                  onChange={(e) => update({ loraRank: Math.max(1, Number(e.target.value) || 1) })}
+                />
+                <div className="chip-row">
+                  {LORA_RANK_PRESETS.map((v) => (
+                    <button
+                      key={v}
+                      className="chip"
+                      aria-pressed={state.loraRank === v}
+                      onClick={() => update({ loraRank: v })}
+                    >
+                      {v}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="field">
+                <label className="field-label" htmlFor="lora-targ">
+                  Adapter targets
+                </label>
+                <select
+                  id="lora-targ"
+                  value={state.loraTargets}
+                  onChange={(e) => update({ loraTargets: e.target.value as CalculatorState['loraTargets'] })}
+                >
+                  {TARGET_OPTIONS.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.label}
+                    </option>
+                  ))}
+                </select>
+                <div className="quant-note">
+                  ≈ {fmtParams(loraAdapterParams(model, state.loraRank, state.loraTargets))} adapter params ·{' '}
+                  {((loraAdapterParams(model, state.loraRank, state.loraTargets) / model.paramsTotal) * 100).toFixed(2)}
+                  % of base
+                </div>
+              </div>
+            </>
+          )}
+          <div className="field">
             <span className="field-label">Precision</span>
             <div className="seg" role="group" aria-label="Training precision">
               <button
@@ -125,7 +205,12 @@ export function ConfigRail({ state, model, update }: Props) {
               >
                 Mixed BF16
               </button>
-              <button aria-pressed={state.trainPrecision === 'fp32'} onClick={() => update({ trainPrecision: 'fp32' })}>
+              <button
+                aria-pressed={state.trainPrecision === 'fp32'}
+                disabled={state.ftMethod === 'qlora'}
+                title={state.ftMethod === 'qlora' ? 'QLoRA computes in bf16' : undefined}
+                onClick={() => update({ trainPrecision: 'fp32' })}
+              >
                 FP32
               </button>
             </div>

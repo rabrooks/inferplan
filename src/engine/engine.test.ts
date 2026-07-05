@@ -6,7 +6,9 @@ import { solveMaxTokens } from './fit'
 import { kvFormat, weightFormat } from './precision'
 import { estimateParams, parseHFConfig } from './hf'
 import {
+  QLORA_BASE_BITS_PER_PARAM,
   estimateTraining,
+  loraAdapterParams,
   minGpusToTrain,
   solveTrainingLimits,
   trainingActivationBytes,
@@ -277,6 +279,186 @@ describe('training fit and limits', () => {
     expect(atMax.totalBytesPerGpu).toBeLessThanOrEqual(usable)
     const over = estimateTraining(m, noCkpt, { sequenceLength: maxSequenceLength + 1, microBatchSize: 1 }, dp8)
     expect(over.totalBytesPerGpu).toBeGreaterThan(usable)
+  })
+})
+
+describe('fine-tuning (LoRA / QLoRA)', () => {
+  const mixedAdamW: TrainingConfig = {
+    optimizer: 'adamw',
+    precision: 'mixed-bf16',
+    zeroStage: 0,
+    checkpointing: 'full',
+  }
+  const ddp1 = { tensorParallel: 1, pipelineParallel: 1, replicas: 1 }
+  const bytesOf = (est: ReturnType<typeof estimateTraining>, id: string) =>
+    est.components.find((c) => c.id === id)!.bytesPerGpu
+
+  // Architectures from the papers the tests are pinned to — not presets.
+  const gpt3: ModelArchitecture = {
+    name: 'GPT-3 175B',
+    paramsTotal: 175e9,
+    paramsActive: 175e9,
+    numLayers: 96,
+    hiddenSize: 12288,
+    numAttentionHeads: 96,
+    numKVHeads: 96,
+    headDim: 128,
+    vocabSize: 50257,
+    intermediateSize: 49152,
+    attentionType: 'mha',
+  }
+  const llama65b: ModelArchitecture = {
+    name: 'LLaMA 65B',
+    paramsTotal: 65.2e9,
+    paramsActive: 65.2e9,
+    numLayers: 80,
+    hiddenSize: 8192,
+    numAttentionHeads: 64,
+    numKVHeads: 64,
+    headDim: 128,
+    vocabSize: 32000,
+    intermediateSize: 22016,
+    attentionType: 'mha',
+  }
+
+  it('LoRA paper pin: GPT-3 175B, r=4 on Q+V ≈ 18.9M adapters — the ~10,000× trainable-param reduction', () => {
+    // Hu et al. 2021: checkpoint drops 350 GB → ~35 MB (fp16), i.e. ~17.5M params.
+    const adapters = loraAdapterParams(gpt3, 4, 'attn-qv')
+    expect(adapters).toBe(4 * (2 * (12288 + 12288)) * 96) // 18,874,368
+    expect(gpt3.paramsTotal / adapters).toBeGreaterThan(9000)
+  })
+
+  it('finetune: "full" (or absent) is exactly the Phase 4 estimator', () => {
+    const m = model('Llama 3.1 8B')
+    const w = { sequenceLength: 4096, microBatchSize: 1 }
+    const plain = estimateTraining(m, mixedAdamW, w, ddp1)
+    const full = estimateTraining(
+      m,
+      { ...mixedAdamW, finetune: { method: 'full', loraRank: 16, loraTargets: 'attn-qv' } },
+      w,
+      ddp1,
+    )
+    expect(full).toEqual(plain)
+  })
+
+  it('LoRA: frozen bf16 base, gradients + optimizer on adapter params only', () => {
+    const m = model('Llama 3.1 8B') // h=4096, attn 32×128, kv 8×128, L=32
+    const adapters = loraAdapterParams(m, 16, 'attn-qv')
+    expect(adapters).toBe(16 * (4096 + 4096 + (4096 + 1024)) * 32) // 6,815,744
+    const est = estimateTraining(
+      m,
+      { ...mixedAdamW, finetune: { method: 'lora', loraRank: 16, loraTargets: 'attn-qv' } },
+      { sequenceLength: 4096, microBatchSize: 1 },
+      ddp1,
+    )
+    expect(bytesOf(est, 'weights')).toBe(2 * m.paramsTotal + 2 * adapters)
+    expect(bytesOf(est, 'gradients')).toBe(2 * adapters)
+    expect(bytesOf(est, 'optimizer')).toBe(12 * adapters)
+  })
+
+  it('QLoRA paper pin: LLaMA 65B lands at ~48 GB on one GPU vs >780 GB for 16-bit full FT', () => {
+    const w = { sequenceLength: 512, microBatchSize: 1 }
+    // Dettmers et al. 2023: full 16-bit finetuning of 65B "requires more than 780 GB".
+    const fullFT = estimateTraining(llama65b, mixedAdamW, w, ddp1)
+    expect(fullFT.totalBytesPerGpu).toBeGreaterThan(780e9)
+    // QLoRA recipe: NF4+DQ base, r=64 adapters on all linear layers, paged 32-bit AdamW.
+    const qlora = estimateTraining(
+      llama65b,
+      { ...mixedAdamW, finetune: { method: 'qlora', loraRank: 64, loraTargets: 'all-linear' } },
+      w,
+      ddp1,
+    )
+    const adapters = loraAdapterParams(llama65b, 64, 'all-linear')
+    expect(adapters).toBe(64 * (4 * (8192 + 8192) + 3 * (8192 + 22016)) * 80) // ≈0.8B
+    // Paper claims "<48GB" average with paging absorbing spikes; we estimate within ±5%.
+    expect(qlora.totalBytesPerGpu / 1e9).toBeGreaterThan(43)
+    expect(qlora.totalBytesPerGpu / 1e9).toBeLessThan(50.5)
+    // The bitsandbytes 8-bit optimizer brings it comfortably under 48 GB.
+    const qlora8bit = estimateTraining(
+      llama65b,
+      { ...mixedAdamW, optimizer: 'adamw-8bit', finetune: { method: 'qlora', loraRank: 64, loraTargets: 'all-linear' } },
+      w,
+      ddp1,
+    )
+    expect(qlora8bit.totalBytesPerGpu).toBeLessThan(48e9)
+  })
+
+  it('QLoRA base weights are 4.127 effective bits (NF4 + double quantization) plus a dequant buffer', () => {
+    expect(QLORA_BASE_BITS_PER_PARAM).toBeCloseTo(4.127, 3)
+    const m = model('Llama 3.1 8B')
+    const w = { sequenceLength: 4096, microBatchSize: 1 }
+    const ft = { loraRank: 16, loraTargets: 'attn-qv' as const }
+    const lora = estimateTraining(m, { ...mixedAdamW, finetune: { method: 'lora', ...ft } }, w, ddp1)
+    const qlora = estimateTraining(m, { ...mixedAdamW, finetune: { method: 'qlora', ...ft } }, w, ddp1)
+    const adapters = loraAdapterParams(m, 16, 'attn-qv')
+    expect(bytesOf(qlora, 'weights')).toBeCloseTo((m.paramsTotal * QLORA_BASE_BITS_PER_PARAM) / 8 + 2 * adapters, -1)
+    // Dequant transient: largest NF4 linear (h × intermediate) held in bf16.
+    expect(bytesOf(qlora, 'overhead') - bytesOf(lora, 'overhead')).toBe(2 * 4096 * 14336)
+  })
+
+  it('activations are unchanged by LoRA/QLoRA — the frozen base still runs forward/backward', () => {
+    const m = model('Llama 3.1 8B')
+    const w = { sequenceLength: 4096, microBatchSize: 1 }
+    const full = estimateTraining(m, mixedAdamW, w, ddp1)
+    const qlora = estimateTraining(
+      m,
+      { ...mixedAdamW, finetune: { method: 'qlora', loraRank: 64, loraTargets: 'all-linear' } },
+      w,
+      ddp1,
+    )
+    expect(bytesOf(qlora, 'activations')).toBe(bytesOf(full, 'activations'))
+  })
+
+  it('ZeRO shards adapter states; the frozen base only shards at stage 3', () => {
+    const m = model('Llama 3.1 8B')
+    const w = { sequenceLength: 1, microBatchSize: 1 }
+    const dp8 = { tensorParallel: 1, pipelineParallel: 1, replicas: 8 }
+    const ft = { method: 'lora' as const, loraRank: 16, loraTargets: 'attn-qv' as const }
+    const adapters = loraAdapterParams(m, 16, 'attn-qv')
+    const z2 = estimateTraining(m, { ...mixedAdamW, zeroStage: 2, finetune: ft }, w, dp8)
+    expect(bytesOf(z2, 'optimizer')).toBe((12 * adapters) / 8)
+    expect(bytesOf(z2, 'gradients')).toBe((2 * adapters) / 8)
+    expect(bytesOf(z2, 'weights')).toBe(2 * m.paramsTotal + 2 * adapters)
+    const z3 = estimateTraining(m, { ...mixedAdamW, zeroStage: 3, finetune: ft }, w, dp8)
+    expect(bytesOf(z3, 'weights')).toBe((2 * m.paramsTotal + 2 * adapters) / 8)
+  })
+
+  it('MoE all-linear targeting counts every expert projection', () => {
+    const m = model('Mixtral 8x7B') // 8 experts, expert FFN 14336
+    const attn = loraAdapterParams(m, 16, 'attn-all')
+    const all = loraAdapterParams(m, 16, 'all-linear')
+    expect(all - attn).toBe(16 * 8 * 3 * (4096 + 14336) * 32)
+  })
+
+  it('QLoRA fits Llama 3.3 70B on a single H100 where full FT needs a big ZeRO-3 cluster', () => {
+    const w = { sequenceLength: 4096, microBatchSize: 1 }
+    const qloraFit = minGpusToTrain(
+      model('Llama 3.3 70B'),
+      { ...mixedAdamW, optimizer: 'adamw-8bit', finetune: { method: 'qlora', loraRank: 16, loraTargets: 'attn-qv' } },
+      w,
+      gpu('h100-sxm'),
+    )
+    expect(qloraFit?.count).toBe(1)
+    const fullFit = minGpusToTrain(model('Llama 3.3 70B'), { ...mixedAdamW, zeroStage: 3 }, w, gpu('h100-sxm'))
+    expect(fullFit?.count).toBeGreaterThanOrEqual(16)
+  })
+
+  it('solver headroom reflects adapter-only states', () => {
+    const m = model('Llama 3.1 8B')
+    const w = { sequenceLength: 4096, microBatchSize: 1 }
+    const h100 = gpu('h100-sxm')
+    const full = solveTrainingLimits(m, mixedAdamW, w, h100, 1)
+    const lora = solveTrainingLimits(
+      m,
+      { ...mixedAdamW, finetune: { method: 'lora', loraRank: 16, loraTargets: 'attn-qv' } },
+      w,
+      h100,
+      1,
+    )
+    // Full FT of 8B is ~128 GB of state — no activation room on one 80 GB GPU.
+    expect(full.freeForActivations).toBe(0)
+    expect(lora.freeForActivations).toBeGreaterThan(50 * GiB)
+    expect(lora.maxMicroBatch).toBeGreaterThan(full.maxMicroBatch)
   })
 })
 

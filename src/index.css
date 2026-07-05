@@ -515,6 +515,7 @@ button:focus-visible {
   color: var(--gauge-label-ink);
   white-space: nowrap;
   overflow: hidden;
+  text-overflow: ellipsis;
 }
 .gauge-capacity-line {
   position: absolute;

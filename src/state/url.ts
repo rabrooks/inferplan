@@ -1,5 +1,12 @@
 import type { ModelArchitecture } from '../engine/types'
-import type { ActivationCheckpointing, TrainingOptimizer, TrainingPrecision, ZeroStage } from '../engine/training'
+import type {
+  ActivationCheckpointing,
+  FinetuneMethod,
+  LoraTargets,
+  TrainingOptimizer,
+  TrainingPrecision,
+  ZeroStage,
+} from '../engine/training'
 import { MODEL_PRESETS } from '../data/models'
 
 export type Scenario = 'inference' | 'training'
@@ -34,6 +41,10 @@ export interface CalculatorState {
   dataParallel: number
   /** Sequences per GPU per step. */
   microBatch: number
+  /** Fine-tuning mode on the training scenario; 'full' is classic training. */
+  ftMethod: FinetuneMethod
+  loraRank: number
+  loraTargets: LoraTargets
 }
 
 export const DEFAULT_STATE: CalculatorState = {
@@ -52,6 +63,9 @@ export const DEFAULT_STATE: CalculatorState = {
   checkpointing: 'selective',
   dataParallel: 8,
   microBatch: 1,
+  ftMethod: 'full',
+  loraRank: 16,
+  loraTargets: 'attn-qv',
 }
 
 export function resolveModel(state: CalculatorState): ModelArchitecture {
@@ -74,6 +88,11 @@ export function stateToParams(state: CalculatorState): URLSearchParams {
     p.set('ctx', String(state.contextLength))
     p.set('mb', String(state.microBatch))
     p.set('dp', String(state.dataParallel))
+    if (state.ftMethod !== 'full') {
+      p.set('ft', state.ftMethod)
+      p.set('rank', String(state.loraRank))
+      p.set('targ', state.loraTargets)
+    }
   } else {
     p.set('w', state.weightFormat)
     p.set('kv', state.kvFormat)
@@ -121,5 +140,8 @@ export function stateFromParams(p: URLSearchParams): CalculatorState {
   s.checkpointing = oneOf(p.get('ckpt'), ['none', 'selective', 'full'] as const, s.checkpointing)
   s.dataParallel = num('dp', s.dataParallel)
   s.microBatch = num('mb', s.microBatch)
+  s.ftMethod = oneOf(p.get('ft'), ['full', 'lora', 'qlora'] as const, s.ftMethod)
+  s.loraRank = num('rank', s.loraRank)
+  s.loraTargets = oneOf(p.get('targ'), ['attn-qv', 'attn-all', 'all-linear'] as const, s.loraTargets)
   return s
 }

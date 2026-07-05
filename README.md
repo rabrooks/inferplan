@@ -4,7 +4,7 @@ Interactive calculators for sizing LLM deployments: how much GPU memory a
 model needs, which GPUs it fits on, and how far a given cluster can stretch.
 All calculation runs client-side; the site is a static build with no backend.
 
-**Inference and training scenarios are live.** The engine and UI are
+**Inference, training, and fine-tuning scenarios are live.** The engine and UI are
 structured so the remaining scenarios extend the same primitives rather than
 starting over.
 
@@ -40,6 +40,11 @@ a deployment needs; InferLens shows what it actually did.**
   ranks, and the Korthikanti et al. activation formula with
   none/selective/full checkpointing. The same inverse solver reports
   activation headroom, max micro-batch, and max sequence length.
+- **Fine-tuning modes** — full FT, LoRA, and QLoRA on the same training
+  engine: frozen bf16 or NF4 (4-bit, double-quantized) base weights,
+  adapter-only gradients/optimizer states from rank × targeted projections,
+  and the QLoRA dequant buffer — pinned to the LoRA and QLoRA papers'
+  published numbers (65B on a single 48 GB GPU).
 - **Shareable URLs** — the entire configuration (including imported custom
   models) is encoded in query params, so a config can be linked in an issue
   or a Slack thread.
@@ -64,8 +69,8 @@ independently and reusable outside the UI.
 | Inference, single GPU | ✅ shipped |
 | Inference, multi-GPU (TP/PP) | ✅ shipped |
 | Training (optimizer states, ZeRO/FSDP, activation checkpointing) | ✅ shipped |
-| Fine-tuning (full FT, LoRA, QLoRA) | planned — next |
-| llm-d multi-pod capacity planning (disaggregated prefill/decode, request-rate-driven sizing) | planned |
+| Fine-tuning (full FT, LoRA, QLoRA) | ✅ shipped |
+| llm-d multi-pod capacity planning (disaggregated prefill/decode, request-rate-driven sizing) | planned — next |
 
 Also planned: comparison mode (side-by-side configs), rough throughput and
 latency estimates from the recorded bandwidth/FLOPS, cloud cost estimates,

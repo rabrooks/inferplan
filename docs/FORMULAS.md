@@ -82,6 +82,50 @@ per-GPU memory. Tensor/pipeline parallelism is not modeled for training yet.
 MoE models are simplified to dense (all experts resident, no expert
 parallelism) with a warning.
 
+## Fine-tuning (LoRA / QLoRA)
+
+Fine-tuning is a mode on the training estimator: full FT is the formula
+above verbatim; LoRA/QLoRA change only *which* parameters carry gradients
+and optimizer states.
+
+Adapter parameters: each targeted projection `W ∈ R^(d_in×d_out)` gains
+rank-`r` factors, summed over layers (GQA-aware — K/V project to
+`H_kv × d_h`; MoE MLP targets count every expert):
+
+```
+adapter_params = r × Σ_targets (d_in + d_out) × L
+```
+
+Pinned to the LoRA paper (Hu et al. 2021): GPT-3 175B with r=4 on Q and V
+gives ~18.9M adapter params — the claimed ~10,000× reduction in trainable
+parameters (350 GB checkpoint → ~35 MB).
+
+Per-GPU state with a frozen base (`A` = adapter params, `P` = base):
+
+```
+weights   = P × base_bytes + A × w_bytes     base_bytes: bf16 = 2,
+gradients = A × g_bytes                        QLoRA NF4+DQ = 4.127 bits / 8
+optimizer = A × opt_bytes
+```
+
+`w/g/opt_bytes` come from the training table above; ZeRO stage rules are
+unchanged (FSDP shards frozen params too). QLoRA's 4.127 effective bits are
+the paper's NF4 + double quantization: 4-bit weights, block-64 fp32 scales
+double-quantized to fp8 with fp32 constants per 256 blocks —
+`4 + 8/64 + 32/(64·256)`. Embeddings/lm_head actually stay 16-bit; treating
+them as quantized underestimates by <2%. QLoRA also adds a transient
+dequantization buffer to overhead (bitsandbytes dequantizes each NF4 tensor
+to bf16 for its matmul): one bf16 copy of the largest linear layer. Paged
+optimizer states are modeled as GPU-resident — paging is an OOM escape
+valve, not a steady-state reduction.
+
+Activations are **unchanged** from full training: the frozen base still
+runs forward and backward, which is why activations dominate LoRA memory.
+
+Pinned to the QLoRA paper (Dettmers et al. 2023): LLaMA 65B with r=64
+adapters on all linear layers estimates to ~48 GB on one GPU — the paper's
+"single 48GB GPU" claim — versus >780 GB for 16-bit full fine-tuning.
+
 ## Activations (training)
 
 From Korthikanti et al., "Reducing Activation Recomputation in Large
