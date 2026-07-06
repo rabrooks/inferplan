@@ -1,0 +1,53 @@
+name: 🧮 Add a model or GPU
+description: Request a new model preset or GPU entry in the database.
+title: "[Data]: "
+labels: ["data"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      Model presets live in [`src/data/models.ts`](https://github.com/rabrooks/inferplan/blob/main/src/data/models.ts)
+      and GPUs in [`src/data/gpus.ts`](https://github.com/rabrooks/inferplan/blob/main/src/data/gpus.ts).
+      Adding one is often a great first pull request — feel free to open a PR
+      directly instead of an issue.
+
+
+      Note: any Hugging Face model can already be imported by pasting its
+      `org/model-name` into the app, so a preset is only needed for
+      convenience or for architectures the importer can't infer.
+- type: dropdown
+  attributes:
+    label: What are you adding?
+    options:
+      - A model preset
+      - A GPU
+    default: 0
+  validations:
+    required: true
+- type: input
+  attributes:
+    label: Name
+    description: e.g. "Qwen3 8B" or "NVIDIA RTX PRO 6000"
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Source for the specs
+    description: >
+      For a model: a Hugging Face URL (so we can read `config.json` / the
+      safetensors index). For a GPU: a datasheet or spec page listing VRAM,
+      memory bandwidth (GB/s), and dense bf16 TFLOPS.
+    placeholder: |
+      https://huggingface.co/...
+      or
+      VRAM 96 GB · bandwidth 1792 GB/s · bf16 ~X TFLOPS (source: ...)
+  validations:
+    required: true
+- type: checkboxes
+  id: checks
+  attributes:
+    label: Before submitting
+    options:
+      - label: I confirmed this model/GPU isn't already in the database.
+        required: true

@@ -1,5 +1,10 @@
 # InferPlan — plan LLM deployments before you buy the GPUs
 
+[![Deploy](https://github.com/rabrooks/inferplan/actions/workflows/deploy.yml/badge.svg)](https://github.com/rabrooks/inferplan/actions/workflows/deploy.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
+**[Try it live → rabrooks.github.io/inferplan](https://rabrooks.github.io/inferplan/)**
+
 Interactive calculators for sizing LLM deployments: how much GPU memory a
 model needs, which GPUs it fits on, how far a given cluster can stretch, and
 how many GPUs a request rate demands. All calculation runs client-side; the
@@ -17,6 +22,9 @@ the exact units InferLens records from each pool (predicted running
 requests, KV usage, phase timings), so a trace overlays a plan
 number-for-number — the shared contract is
 [docs/interop.md](docs/interop.md).
+
+![InferPlan inference scenario: a per-GPU VRAM gauge and memory breakdown for
+Llama 3.3 70B on H100s](docs/img/inference.png)
 
 ## Features
 
@@ -36,9 +44,10 @@ number-for-number — the shared contract is
   as an independent choice (FP8 KV halves the biggest scaling term).
 - **Multi-GPU** — tensor and pipeline parallelism with the real sharding
   rules: head-divisibility checks, KV replication when TP exceeds KV heads.
-- **GPU database** — B200 through RTX 4090 and MI300X/MI325X, with memory
-  bandwidth and FLOPS recorded for the throughput estimates coming in later
-  phases.
+- **GPU database** — 13 accelerators, B200 through RTX 5090/4090 and
+  MI300X/MI325X, each with memory bandwidth and bf16 FLOPS recorded so the
+  same entry drives both the VRAM fit and the llm-d throughput/latency
+  roofline.
 - **Inverse solver** — max context length / max concurrent sequences for a
   given GPU, and the smallest count of every GPU model that serves the config.
 - **Training memory** — mixed-precision or FP32 states (AdamW / AdamW 8-bit /
@@ -63,12 +72,36 @@ number-for-number — the shared contract is
   models) is encoded in query params, so a config can be linked in an issue
   or a Slack thread.
 
+## Screenshots
+
+**Fine-tuning** — QLoRA on Llama 3.3 70B, the frozen NF4 base and adapter-only
+optimizer states broken out per stratum, with activations (not weights)
+dominating the footprint:
+
+![Training scenario in QLoRA mode: NF4 base weights, adapter optimizer states,
+and a dominant activation stratum, fitting on 8× B200](docs/img/finetune-qlora.png)
+
+**llm-d fleet sizing** — a 100 req/s deployment sized to 500 ms TTFT / 100 ms
+TPOT SLOs: prefill and decode pools counted separately, with the queue-wait and
+service-time split shown against each SLO tick:
+
+![llm-d scenario: TTFT/TPOT bullet bars against SLOs and separately sized
+prefill and decode pools for 100 req/s on H100s](docs/img/llmd.png)
+
+The UI ships a light theme alongside the default dark instrument theme (toggle
+in the top-right; follows your OS preference until you choose):
+
+![The same inference view rendered in the light theme](docs/img/inference-light.png)
+
 ## Quick start
+
+Requires Node 20+ (CI builds on Node 24).
 
 ```sh
 npm install
 npm run dev     # local dev server
-npm test        # engine unit tests (vitest)
+npm test        # engine + URL round-trip tests (vitest)
+npm run lint    # oxlint
 npm run build   # static production build in dist/
 ```
 
@@ -132,10 +165,13 @@ planning tool, not a benchmark.
 
 ## Contributing
 
-Model presets live in `src/data/models.ts`, GPUs in `src/data/gpus.ts`, and
-every formula in `src/engine/` has a corresponding test in
-`src/engine/engine.test.ts`. PRs that add models/GPUs or tighten a formula
-against measured numbers are very welcome.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the project layout, and the
+conventions that keep the engine auditable. In short: model presets live in
+`src/data/models.ts`, GPUs in `src/data/gpus.ts`, and every formula in
+`src/engine/` has a corresponding test in `src/engine/engine.test.ts` pinned
+to a published number. PRs that add models/GPUs or tighten a formula against
+measured numbers are very welcome. Participation is governed by our
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 

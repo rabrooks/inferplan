@@ -1,0 +1,47 @@
+name: 🐛 Bug report
+description: A number looks wrong, the UI misbehaves, or something crashes.
+title: "[Bug]: "
+labels: ["bug"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before filing, please search [existing issues](https://github.com/rabrooks/inferplan/issues?q=is%3Aissue+sort%3Acreated-desc) to check it hasn't already been reported.
+- type: textarea
+  attributes:
+    label: Shareable config link
+    description: >
+      InferPlan encodes the entire configuration in the URL. Click **SHARE
+      CONFIG** in the app (or copy your address bar) and paste the link here —
+      it's the fastest way for us to reproduce exactly what you saw.
+    placeholder: https://rabrooks.github.io/inferplan/?model=...
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: What happened
+    description: >
+      A clear and concise description of the bug. If a computed number looks
+      wrong, tell us which figure, what value it showed, and what you expected
+      instead (with a source if you have one).
+    placeholder: |
+      The KV-cache figure for <model> at <context> shows X GiB, but I expected
+      ~Y GiB because ...
+  validations:
+    required: true
+- type: input
+  attributes:
+    label: Browser / OS
+    description: e.g. Chrome 126 on macOS 15, Firefox 128 on Ubuntu 24.04
+  validations:
+    required: false
+- type: checkboxes
+  id: checks
+  attributes:
+    label: Before submitting
+    options:
+      - label: I searched existing issues and this isn't a duplicate.
+        required: true
+      - label: I included a shareable config link (or explained why I can't).
+        required: true

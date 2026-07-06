@@ -2,7 +2,7 @@ import type { GPUSpec } from '../engine/types'
 
 /**
  * GPU database. bf16TFLOPS is dense (non-sparse) tensor-core throughput;
- * bandwidth and FLOPS feed throughput/latency estimates in later phases.
+ * bandwidth and FLOPS feed the llm-d throughput/latency roofline (llmd.ts).
  */
 export const GPU_DATABASE: GPUSpec[] = [
   { id: 'b200', name: 'NVIDIA B200', vendor: 'nvidia', vramGiB: 192, memoryBandwidthGBs: 8000, bf16TFLOPS: 2250 },
