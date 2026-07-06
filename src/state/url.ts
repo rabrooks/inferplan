@@ -9,7 +9,7 @@ import type {
 } from '../engine/training'
 import { MODEL_PRESETS } from '../data/models'
 
-export type Scenario = 'inference' | 'training'
+export type Scenario = 'inference' | 'training' | 'llmd'
 
 /**
  * Calculator state serialized into the URL so configurations are
@@ -45,6 +45,21 @@ export interface CalculatorState {
   ftMethod: FinetuneMethod
   loraRank: number
   loraTargets: LoraTargets
+  // --- llm-d scenario ---
+  /** Mean arrival rate λ, requests per second. */
+  requestRate: number
+  inputTokens: number
+  outputTokens: number
+  ttftSloMs: number
+  tpotSloMs: number
+  prefillGpuId: string
+  prefillTp: number
+  decodeGpuId: string
+  decodeTp: number
+  /** Calibratable knobs (docs/interop.md) — serialized only when non-default. */
+  llmdMfu: number
+  llmdBwEff: number
+  llmdKvBeta: number
 }
 
 export const DEFAULT_STATE: CalculatorState = {
@@ -66,6 +81,18 @@ export const DEFAULT_STATE: CalculatorState = {
   ftMethod: 'full',
   loraRank: 16,
   loraTargets: 'attn-qv',
+  requestRate: 50,
+  inputTokens: 1024,
+  outputTokens: 256,
+  ttftSloMs: 500,
+  tpotSloMs: 100,
+  prefillGpuId: 'h100-sxm',
+  prefillTp: 1,
+  decodeGpuId: 'h100-sxm',
+  decodeTp: 1,
+  llmdMfu: 0.45,
+  llmdBwEff: 0.7,
+  llmdKvBeta: 1.8,
 }
 
 export function resolveModel(state: CalculatorState): ModelArchitecture {
@@ -93,6 +120,22 @@ export function stateToParams(state: CalculatorState): URLSearchParams {
       p.set('rank', String(state.loraRank))
       p.set('targ', state.loraTargets)
     }
+  } else if (state.scenario === 'llmd') {
+    p.set('sc', 'llmd')
+    p.set('w', state.weightFormat)
+    p.set('kv', state.kvFormat)
+    p.set('rate', String(state.requestRate))
+    p.set('in', String(state.inputTokens))
+    p.set('out', String(state.outputTokens))
+    p.set('ttft', String(state.ttftSloMs))
+    p.set('tpot', String(state.tpotSloMs))
+    p.set('pgpu', state.prefillGpuId)
+    p.set('ptp', String(state.prefillTp))
+    p.set('dgpu', state.decodeGpuId)
+    p.set('dtp', String(state.decodeTp))
+    if (state.llmdMfu !== DEFAULT_STATE.llmdMfu) p.set('mfu', String(state.llmdMfu))
+    if (state.llmdBwEff !== DEFAULT_STATE.llmdBwEff) p.set('beff', String(state.llmdBwEff))
+    if (state.llmdKvBeta !== DEFAULT_STATE.llmdKvBeta) p.set('beta', String(state.llmdKvBeta))
   } else {
     p.set('w', state.weightFormat)
     p.set('kv', state.kvFormat)
@@ -111,7 +154,7 @@ function oneOf<T extends string>(v: string | null, allowed: readonly T[], fallba
 
 export function stateFromParams(p: URLSearchParams): CalculatorState {
   const s: CalculatorState = { ...DEFAULT_STATE }
-  s.scenario = p.get('sc') === 'training' ? 'training' : 'inference'
+  s.scenario = oneOf(p.get('sc'), ['inference', 'training', 'llmd'] as const, 'inference')
   const model = p.get('model')
   if (model) s.modelName = model
   const arch = p.get('arch')
@@ -143,5 +186,25 @@ export function stateFromParams(p: URLSearchParams): CalculatorState {
   s.ftMethod = oneOf(p.get('ft'), ['full', 'lora', 'qlora'] as const, s.ftMethod)
   s.loraRank = num('rank', s.loraRank)
   s.loraTargets = oneOf(p.get('targ'), ['attn-qv', 'attn-all', 'all-linear'] as const, s.loraTargets)
+  // llm-d params. A knob outside its plausible range falls back to the
+  // documented default rather than silently producing nonsense estimates.
+  const knob = (key: string, fallback: number, min: number, max: number) => {
+    const raw = p.get(key)
+    if (raw === null) return fallback
+    const v = Number(raw)
+    return Number.isFinite(v) && v >= min && v <= max ? v : fallback
+  }
+  s.requestRate = knob('rate', s.requestRate, 0, 1e6)
+  s.inputTokens = num('in', s.inputTokens)
+  s.outputTokens = num('out', s.outputTokens)
+  s.ttftSloMs = num('ttft', s.ttftSloMs)
+  s.tpotSloMs = num('tpot', s.tpotSloMs)
+  s.prefillGpuId = p.get('pgpu') ?? s.prefillGpuId
+  s.prefillTp = num('ptp', s.prefillTp)
+  s.decodeGpuId = p.get('dgpu') ?? s.decodeGpuId
+  s.decodeTp = num('dtp', s.decodeTp)
+  s.llmdMfu = knob('mfu', s.llmdMfu, 0.05, 1)
+  s.llmdBwEff = knob('beff', s.llmdBwEff, 0.05, 1)
+  s.llmdKvBeta = knob('beta', s.llmdKvBeta, 1, 5)
   return s
 }

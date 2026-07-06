@@ -10,7 +10,7 @@ export interface FitCard {
 interface Props {
   /** Smallest deployment of this GPU that holds the current config, or null. */
   fitFor: (gpu: GPUSpec) => FitCard | null
-  /** Shown when fitFor returns null, e.g. ">128 GPUs". */
+  /** Shown verbatim when fitFor returns null, e.g. ">128 GPUs" or "SLO not met". */
   noFitLabel: string
   selectedGpuId: string
   onSelect: (gpuId: string) => void
@@ -42,7 +42,7 @@ export function FitGrid({ fitFor, noFitLabel, selectedGpuId, onSelect }: Props) 
                 {fit.count}× <span className="fit-card-shape">{fit.shapeLabel}</span>
               </div>
             ) : (
-              <div className="fit-card-verdict no">&gt;{noFitLabel}</div>
+              <div className="fit-card-verdict no">{noFitLabel}</div>
             )}
           </button>
         )

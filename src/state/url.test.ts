@@ -66,6 +66,49 @@ describe('URL round-trip', () => {
     expect(stateFromParams(fullFt).ftMethod).toBe('full')
   })
 
+  it('llm-d state round-trips; default knobs stay out of the URL', () => {
+    const state: CalculatorState = {
+      ...DEFAULT_STATE,
+      scenario: 'llmd',
+      modelName: 'DeepSeek-V3 / R1 671B (MoE, MLA)',
+      weightFormat: 'fp8',
+      kvFormat: 'fp8',
+      requestRate: 20,
+      inputTokens: 2048,
+      outputTokens: 512,
+      ttftSloMs: 400,
+      tpotSloMs: 50,
+      prefillGpuId: 'h200',
+      prefillTp: 8,
+      decodeGpuId: 'mi300x',
+      decodeTp: 4,
+    }
+    const p = stateToParams(state)
+    expect(p.get('sc')).toBe('llmd')
+    expect(p.get('mfu')).toBeNull()
+    expect(p.get('beff')).toBeNull()
+    expect(p.get('beta')).toBeNull()
+    expect(stateFromParams(p)).toEqual(state)
+  })
+
+  it('llm-d knobs round-trip when changed and reject out-of-range values', () => {
+    const state: CalculatorState = { ...DEFAULT_STATE, scenario: 'llmd', llmdMfu: 0.55, llmdBwEff: 0.8, llmdKvBeta: 1.9 }
+    const parsed = stateFromParams(stateToParams(state))
+    expect(parsed.llmdMfu).toBe(0.55)
+    expect(parsed.llmdBwEff).toBe(0.8)
+    expect(parsed.llmdKvBeta).toBe(1.9)
+    const bad = stateFromParams(new URLSearchParams('sc=llmd&mfu=7&beff=-1&beta=99&rate=-5'))
+    expect(bad.llmdMfu).toBe(DEFAULT_STATE.llmdMfu)
+    expect(bad.llmdBwEff).toBe(DEFAULT_STATE.llmdBwEff)
+    expect(bad.llmdKvBeta).toBe(DEFAULT_STATE.llmdKvBeta)
+    expect(bad.requestRate).toBe(DEFAULT_STATE.requestRate)
+  })
+
+  it('inference and training URLs stay free of llm-d params', () => {
+    expect(stateToParams(DEFAULT_STATE).get('rate')).toBeNull()
+    expect(stateToParams({ ...DEFAULT_STATE, scenario: 'training' }).get('pgpu')).toBeNull()
+  })
+
   it('a pre-training-release inference URL still parses (defaults fill the new fields)', () => {
     const p = new URLSearchParams('model=Llama+3.1+8B&w=bf16&kv=fp16&ctx=8192&seqs=8&tp=1&pp=1&gpu=h100-sxm')
     const s = stateFromParams(p)

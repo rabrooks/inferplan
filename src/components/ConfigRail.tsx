@@ -5,6 +5,7 @@ import { KV_FORMATS, WEIGHT_FORMATS, weightFormat } from '../engine/precision'
 import { ZERO_STAGE_NOTES, loraAdapterParams, type FinetuneMethod, type ZeroStage } from '../engine/training'
 import type { ModelArchitecture } from '../engine/types'
 import { MODEL_PRESETS } from '../data/models'
+import { GPU_DATABASE } from '../data/gpus'
 import type { CalculatorState } from '../state/url'
 
 interface Props {
@@ -30,6 +31,13 @@ const CKPT_NOTES = {
 
 const LORA_RANK_PRESETS = [8, 16, 32, 64]
 
+const RATE_PRESETS = [1, 10, 50, 100]
+const IN_TOK_PRESETS = [512, 1024, 4096, 32768]
+const OUT_TOK_PRESETS = [128, 256, 1024, 4096]
+const TTFT_PRESETS = [250, 500, 1000, 2000]
+const TPOT_PRESETS = [25, 50, 100, 200]
+const POOL_TP_OPTIONS = [1, 2, 4, 8]
+
 const FT_NOTES: Record<FinetuneMethod, string> = {
   full: 'every parameter carries gradients and optimizer states',
   lora: 'frozen bf16 base; only low-rank adapters train',
@@ -41,6 +49,126 @@ const TARGET_OPTIONS = [
   { id: 'attn-all', label: 'All attention — Q, K, V, O' },
   { id: 'all-linear', label: 'All linear layers — QLoRA recipe' },
 ] as const
+
+function NumField({
+  id,
+  label,
+  value,
+  presets,
+  onChange,
+  min = 1,
+}: {
+  id: string
+  label: string
+  value: number
+  presets: number[]
+  onChange: (v: number) => void
+  min?: number
+}) {
+  return (
+    <div className="field">
+      <label className="field-label" htmlFor={id}>
+        {label}
+      </label>
+      <input
+        id={id}
+        type="number"
+        min={min}
+        value={value}
+        onChange={(e) => onChange(Math.max(min, Number(e.target.value) || min))}
+      />
+      <div className="chip-row">
+        {presets.map((v) => (
+          <button key={v} className="chip" aria-pressed={value === v} onClick={() => onChange(v)}>
+            {v >= 1024 && v % 1024 === 0 ? `${v / 1024}k` : v}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function KnobField({
+  id,
+  label,
+  value,
+  note,
+  min,
+  max,
+  step,
+  onChange,
+}: {
+  id: string
+  label: string
+  value: number
+  note: string
+  min: number
+  max: number
+  step: number
+  onChange: (v: number) => void
+}) {
+  return (
+    <div className="field">
+      <label className="field-label" htmlFor={id}>
+        {label}
+      </label>
+      <input
+        id={id}
+        type="number"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => {
+          const v = Number(e.target.value)
+          if (Number.isFinite(v)) onChange(Math.min(max, Math.max(min, v)))
+        }}
+      />
+      <div className="quant-note">{note}</div>
+    </div>
+  )
+}
+
+function PoolFields({
+  poolLabel,
+  gpuId,
+  tp,
+  onGpu,
+  onTp,
+}: {
+  poolLabel: string
+  gpuId: string
+  tp: number
+  onGpu: (id: string) => void
+  onTp: (tp: number) => void
+}) {
+  return (
+    <>
+      <div className="field">
+        <label className="field-label" htmlFor={`${poolLabel}-gpu`}>
+          {poolLabel} pool GPU
+        </label>
+        <select id={`${poolLabel}-gpu`} value={gpuId} onChange={(e) => onGpu(e.target.value)}>
+          {GPU_DATABASE.map((g) => (
+            <option key={g.id} value={g.id}>
+              {g.name} — {g.vramGiB} GiB
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="field">
+        <span className="field-label">{poolLabel} pod tensor parallelism (GPUs per pod)</span>
+        <div className="seg" role="group" aria-label={`${poolLabel} pod tensor parallelism`}>
+          {POOL_TP_OPTIONS.map((v) => (
+            <button key={v} aria-pressed={tp === v} onClick={() => onTp(v)}>
+              {v}
+            </button>
+          ))}
+        </div>
+      </div>
+    </>
+  )
+}
 
 export function ConfigRail({ state, model, update }: Props) {
   const [hfInput, setHfInput] = useState('')
@@ -63,6 +191,7 @@ export function ConfigRail({ state, model, update }: Props) {
 
   const wf = weightFormat(state.weightFormat)
   const training = state.scenario === 'training'
+  const llmd = state.scenario === 'llmd'
 
   return (
     <div className="rail">
@@ -283,6 +412,108 @@ export function ConfigRail({ state, model, update }: Props) {
         </section>
       )}
 
+      {llmd && (
+        <>
+          <section className="section">
+            <div className="eyebrow">WORKLOAD</div>
+            <NumField
+              id="rate"
+              label="Request rate (req/s)"
+              value={state.requestRate}
+              presets={RATE_PRESETS}
+              min={0.1}
+              onChange={(v) => update({ requestRate: v })}
+            />
+            <NumField
+              id="in-tok"
+              label="Input length (tokens, mean)"
+              value={state.inputTokens}
+              presets={IN_TOK_PRESETS}
+              onChange={(v) => update({ inputTokens: v })}
+            />
+            <NumField
+              id="out-tok"
+              label="Output length (tokens, mean)"
+              value={state.outputTokens}
+              presets={OUT_TOK_PRESETS}
+              onChange={(v) => update({ outputTokens: v })}
+            />
+          </section>
+          <section className="section">
+            <div className="eyebrow">LATENCY SLOs</div>
+            <NumField
+              id="ttft-slo"
+              label="Time to first token, TTFT (ms)"
+              value={state.ttftSloMs}
+              presets={TTFT_PRESETS}
+              onChange={(v) => update({ ttftSloMs: v })}
+            />
+            <NumField
+              id="tpot-slo"
+              label="Time per output token, TPOT (ms)"
+              value={state.tpotSloMs}
+              presets={TPOT_PRESETS}
+              onChange={(v) => update({ tpotSloMs: v })}
+            />
+          </section>
+          <section className="section">
+            <div className="eyebrow">POOLS</div>
+            <PoolFields
+              poolLabel="Prefill"
+              gpuId={state.prefillGpuId}
+              tp={state.prefillTp}
+              onGpu={(prefillGpuId) => update({ prefillGpuId })}
+              onTp={(prefillTp) => update({ prefillTp })}
+            />
+            <PoolFields
+              poolLabel="Decode"
+              gpuId={state.decodeGpuId}
+              tp={state.decodeTp}
+              onGpu={(decodeGpuId) => update({ decodeGpuId })}
+              onTp={(decodeTp) => update({ decodeTp })}
+            />
+          </section>
+          <section className="section">
+            <div className="eyebrow">ASSUMPTIONS</div>
+            <KnobField
+              id="mfu"
+              label="Prefill MFU"
+              value={state.llmdMfu}
+              note="model FLOPs utilization, dense prefill band 0.4–0.5"
+              min={0.05}
+              max={1}
+              step={0.05}
+              onChange={(llmdMfu) => update({ llmdMfu })}
+            />
+            <KnobField
+              id="beff"
+              label="Decode bandwidth efficiency"
+              value={state.llmdBwEff}
+              note="fraction of spec-sheet HBM bandwidth achieved, band 0.5–0.8"
+              min={0.05}
+              max={1}
+              step={0.05}
+              onChange={(llmdBwEff) => update({ llmdBwEff })}
+            />
+            <KnobField
+              id="beta"
+              label="KV-transfer TTFT factor (β)"
+              value={state.llmdKvBeta}
+              note="published 1.8–1.9×, interconnect-dependent"
+              min={1}
+              max={5}
+              step={0.1}
+              onChange={(llmdKvBeta) => update({ llmdKvBeta })}
+            />
+            <div className="quant-note">
+              Documented heuristics, not measured constants — calibrate each from an InferLens trace of your
+              hardware.
+            </div>
+          </section>
+        </>
+      )}
+
+      {!llmd && (
       <section className="section">
         <div className="eyebrow">WORKLOAD</div>
         <div className="field">
@@ -361,7 +592,9 @@ export function ConfigRail({ state, model, update }: Props) {
           </div>
         )}
       </section>
+      )}
 
+      {!llmd && (
       <section className="section">
         <div className="eyebrow">TOPOLOGY</div>
         {training ? (
@@ -422,6 +655,7 @@ export function ConfigRail({ state, model, update }: Props) {
           </>
         )}
       </section>
+      )}
     </div>
   )
 }

@@ -16,6 +16,7 @@ import { ConfigRail } from './components/ConfigRail'
 import { VramGauge } from './components/VramGauge'
 import { BreakdownTable } from './components/BreakdownTable'
 import { FitGrid } from './components/FitGrid'
+import { LlmdResults } from './components/LlmdResults'
 
 type Theme = 'dark' | 'light'
 
@@ -79,6 +80,7 @@ export default function App() {
 
   const model = resolveModel(state)
   const training = state.scenario === 'training'
+  const llmd = state.scenario === 'llmd'
   const quant = useMemo(
     () => ({ weights: weightFormat(state.weightFormat), kvCache: kvFormat(state.kvFormat) }),
     [state.weightFormat, state.kvFormat],
@@ -138,14 +140,14 @@ export default function App() {
       <header className="masthead">
         <div>
           <div className="wordmark">
-            INFERPLAN<span> / GPU memory</span>
+            INFERPLAN<span>{llmd ? ' / capacity planning' : ' / GPU memory'}</span>
           </div>
           <div className="masthead-sub">LLM deployment calculator — estimates, not benchmarks</div>
         </div>
         <nav className="scenario-tabs" aria-label="Scenario">
           <button
             className="scenario-tab"
-            aria-current={!training || undefined}
+            aria-current={(!training && !llmd) || undefined}
             onClick={() => update({ scenario: 'inference' })}
           >
             Inference
@@ -157,8 +159,8 @@ export default function App() {
           >
             Training
           </button>
-          <button className="scenario-tab" disabled title="Planned — see roadmap">
-            llm-d<span className="soon">SOON</span>
+          <button className="scenario-tab" aria-current={llmd || undefined} onClick={() => update({ scenario: 'llmd' })}>
+            llm-d
           </button>
         </nav>
         <button className="share-btn" onClick={share}>
@@ -186,6 +188,9 @@ export default function App() {
       <div className="layout">
         <ConfigRail state={state} model={model} update={update} />
 
+        {llmd ? (
+          <LlmdResults state={state} model={model} quant={quant} update={update} />
+        ) : (
         <main className="results">
           <div className="verdict">
             <h1 className="verdict-headline">
@@ -337,7 +342,7 @@ export default function App() {
             </div>
             <FitGrid
               fitFor={fitCardFor}
-              noFitLabel={training ? '1024 GPUs' : '128 GPUs'}
+              noFitLabel={training ? '>1024 GPUs' : '>128 GPUs'}
               selectedGpuId={gpu.id}
               onSelect={(gpuId) => update({ gpuId })}
             />
@@ -361,6 +366,7 @@ export default function App() {
             )}
           </p>
         </main>
+        )}
       </div>
     </div>
   )
