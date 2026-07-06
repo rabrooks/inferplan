@@ -15,6 +15,18 @@ import {
   trainingBytesPerParam,
   type TrainingConfig,
 } from './training'
+import {
+  DEFAULT_LLMD_KNOBS,
+  decodeKvBytesPerSeqPerGpu,
+  decodeStepSeconds,
+  decodeWeightBytesPerStepPerGpu,
+  erlangCMeanWaitSeconds,
+  erlangCWaitProbability,
+  planLlmd,
+  prefillFlops,
+  prefillSeconds,
+  type LlmdWorkload,
+} from './llmd'
 import type { ModelArchitecture } from './types'
 
 const model = (name: string): ModelArchitecture => {
@@ -459,6 +471,224 @@ describe('fine-tuning (LoRA / QLoRA)', () => {
     expect(full.freeForActivations).toBe(0)
     expect(lora.freeForActivations).toBeGreaterThan(50 * GiB)
     expect(lora.maxMicroBatch).toBeGreaterThan(full.maxMicroBatch)
+  })
+})
+
+describe('llm-d capacity planning', () => {
+  const h100 = gpu('h100-sxm')
+  const pool = (gpuId: string, tp: number, pp = 1) => ({
+    gpu: gpu(gpuId),
+    tensorParallel: tp,
+    pipelineParallel: pp,
+  })
+
+  describe('prefill roofline (compute-bound)', () => {
+    it('MoE prefill FLOPs use active params, not total (Mixtral)', () => {
+      const m = model('Mixtral 8x7B') // 12.9B active of 46.7B total
+      const flops = prefillFlops(m, 1000)
+      // 2·P_active·T + 2·T²·(heads·headDim)·L
+      expect(flops).toBe(2 * 12.9e9 * 1000 + 2 * 1000 ** 2 * (32 * 128) * 32)
+      expect(flops).toBeLessThan(2 * m.paramsTotal * 1000)
+    })
+
+    it('Meta measured pin: Llama3-405B 128K prefill on one 8×H100 host ≈ 60 s; our bf16-spec formula at default MFU lands within 20%', () => {
+      // arXiv:2411.01783 (Context Parallelism, MLSys'25): ~60 s measured (FP8).
+      const t = prefillSeconds(model('Llama 3.1 405B'), 131072, h100, 8, DEFAULT_LLMD_KNOBS.prefillMFU)
+      expect(t).toBeGreaterThan(60 * 0.75)
+      expect(t).toBeLessThan(60 * 1.05)
+    })
+
+    it('Meta measured pin: 405B at 1M tokens on 128 H100s at their measured 63% util ≈ 77 s, attention term is ~84% of FLOPs', () => {
+      // Same paper: 1M-token prefill ≈ 77 s at 63% FLOPS utilization.
+      const m = model('Llama 3.1 405B')
+      const t = prefillSeconds(m, 1048576, h100, 128, 0.63)
+      expect(t / 77).toBeGreaterThan(0.85)
+      expect(t / 77).toBeLessThan(1.1)
+      // The quadratic attention term dominates at 1M context — this is why
+      // it is always included rather than gated on a crossover heuristic.
+      const attnShare = 1 - (2 * m.paramsActive * 1048576) / prefillFlops(m, 1048576)
+      expect(attnShare).toBeCloseTo(0.84, 2)
+    })
+  })
+
+  describe('decode roofline (bandwidth-bound)', () => {
+    it('BentoML handbook pin: 70B FP16 (~140 GB) on H100 3.35 TB/s → ~24 tok/s single-sequence ceiling', () => {
+      // bentoml.com/llm/getting-started/choosing-the-right-gpu: "a theoretical
+      // ceiling of about 24 tokens/s per sequence" (before KV, eff = 1).
+      const m70: ModelArchitecture = {
+        name: '70B dense',
+        paramsTotal: 70e9,
+        paramsActive: 70e9,
+        numLayers: 80,
+        hiddenSize: 8192,
+        numAttentionHeads: 64,
+        numKVHeads: 8,
+        headDim: 128,
+        vocabSize: 128256,
+        intermediateSize: 28672,
+        attentionType: 'gqa',
+      }
+      const step = decodeStepSeconds(m70, quantOf('fp16', 'fp16'), pool('h100-sxm', 1), 1, 0, 1.0)
+      expect(1 / step).toBeCloseTo(23.9, 1)
+    })
+
+    it('fleet-sim cross-check (order of magnitude only): derived W and H for Llama-70B/H100/8K bracket their calibrated 4.0 ms and 0.32 ms/slot', () => {
+      // arXiv:2603.16054 calibrates t_iter(n) = W + H·n by hand. Our
+      // physically derived values differ (their constants bake in unstated
+      // TP/quant/occupancy assumptions) but must land in the same regime.
+      const m = model('Llama 3.3 70B')
+      const hMs = (decodeKvBytesPerSeqPerGpu(m, quantOf('bf16', 'fp16'), pool('h100-sxm', 1), 8192) / 3.35e12) * 1000
+      expect(hMs).toBeCloseTo(0.8, 2)
+      expect(hMs / 0.32).toBeLessThan(4)
+      const wMs = (decodeWeightBytesPerStepPerGpu(m, quantOf('bf16', 'fp16'), pool('h100-sxm', 8), 1) / 3.35e12) * 1000
+      expect(wMs / 4.0).toBeGreaterThan(0.5)
+      expect(wMs / 4.0).toBeLessThan(2)
+    })
+
+    it('dense weight traffic is batch-independent; KV traffic scales linearly with the batch', () => {
+      const m = model('Llama 3.3 70B')
+      const q = quantOf('bf16', 'fp16')
+      const p = pool('h100-sxm', 2)
+      expect(decodeWeightBytesPerStepPerGpu(m, q, p, 1)).toBe(decodeWeightBytesPerStepPerGpu(m, q, p, 64))
+      const s1 = decodeStepSeconds(m, q, p, 1, 4096, 0.7)
+      const s65 = decodeStepSeconds(m, q, p, 65, 4096, 0.7)
+      expect((s65 - s1) / 64).toBeCloseTo(decodeKvBytesPerSeqPerGpu(m, q, p, 4096) / (3.35e12 * 0.7), 12)
+    })
+
+    it('MoE expert coverage: batch 1 streams active params only, large batches stream toward all experts (DeepSeek-V3)', () => {
+      const ds = model('DeepSeek-V3 / R1 671B (MoE, MLA)')
+      const q = quantOf('fp8', 'fp8')
+      const p = pool('h200', 8)
+      expect(decodeWeightBytesPerStepPerGpu(ds, q, p, 1)).toBeCloseTo(37e9 / 8, 0)
+      const large = decodeWeightBytesPerStepPerGpu(ds, q, p, 10000)
+      expect(large / (671e9 / 8)).toBeGreaterThan(0.99)
+      // monotone in n
+      expect(decodeWeightBytesPerStepPerGpu(ds, q, p, 64)).toBeGreaterThan(decodeWeightBytesPerStepPerGpu(ds, q, p, 8))
+    })
+
+    it('MLA KV is replicated across TP ranks: per-GPU KV traffic does not shrink with TP', () => {
+      const ds = model('DeepSeek-V3 / R1 671B (MoE, MLA)')
+      const q = quantOf('fp8', 'fp8')
+      expect(decodeKvBytesPerSeqPerGpu(ds, q, pool('h200', 8), 1000)).toBe(
+        decodeKvBytesPerSeqPerGpu(ds, q, pool('h200', 1), 1000),
+      )
+    })
+  })
+
+  describe('Erlang C queueing', () => {
+    it('reduces to M/M/1: P(wait) = ρ and W_q = ρ/(1−ρ)·s at c=1', () => {
+      expect(erlangCWaitProbability(1, 0.5)).toBeCloseTo(0.5, 10)
+      expect(erlangCMeanWaitSeconds(1, 0.5, 2)).toBeCloseTo(2, 10)
+    })
+
+    it('matches the published M/M/2 value: a=1 erlang → P(wait) = 1/3', () => {
+      expect(erlangCWaitProbability(2, 1)).toBeCloseTo(1 / 3, 10)
+    })
+
+    it('adding servers reduces the wait; an unstable queue waits forever', () => {
+      expect(erlangCMeanWaitSeconds(3, 1, 1)).toBeLessThan(erlangCMeanWaitSeconds(2, 1, 1))
+      expect(erlangCMeanWaitSeconds(1, 1.2, 1)).toBe(Infinity)
+    })
+  })
+
+  describe('planLlmd end-to-end', () => {
+    // The worked example: Llama 3.3 70B bf16, 100 req/s of 1024-in/256-out,
+    // fleet-sim's SLO defaults (TTFT 500 ms, TPOT 100 ms), H100 TP=2 pods.
+    const workload: LlmdWorkload = {
+      requestRate: 100,
+      inputTokens: 1024,
+      outputTokens: 256,
+      ttftSloMs: 500,
+      tpotSloMs: 100,
+    }
+    const m70 = model('Llama 3.3 70B')
+    const q = quantOf('bf16', 'fp16')
+
+    it('sizes the 100 req/s 70B fleet: both SLOs met, both pools under the ρ ≤ 0.85 cap, KV-bound decode', () => {
+      const plan = planLlmd(m70, q, workload, pool('h100-sxm', 2), pool('h100-sxm', 2))
+      expect(plan.feasible).toBe(true)
+      expect(plan.prefill.pods).toBe(20)
+      expect(plan.decode.pods).toBe(33)
+      expect(plan.prefill.ttftMs).toBeLessThanOrEqual(500)
+      expect(plan.decode.tpotMs).toBeLessThanOrEqual(100)
+      expect(plan.prefill.utilization).toBeLessThanOrEqual(0.85)
+      expect(plan.decode.utilization).toBeLessThanOrEqual(0.85 + 1e-9)
+      // 80 GiB of H100 fills with KV long before the 100 ms TPOT budget does.
+      expect(plan.decode.concurrencyBound).toBe('kv-capacity')
+      expect(plan.totalGpus).toBe(20 * 2 + 33 * 2)
+    })
+
+    it('emits the InferLens vocabulary: predicted running requests, KV usage fraction, phase timings', () => {
+      const plan = planLlmd(m70, q, workload, pool('h100-sxm', 2), pool('h100-sxm', 2))
+      expect(plan.decode.numRunningReqs).toBeCloseTo(24.9, 1)
+      expect(plan.decode.kvCacheUsage).toBeCloseTo(0.8, 1)
+      expect(plan.decode.kvCacheUsage).toBeLessThan(1)
+      expect(plan.prefill.queueMs).toBeGreaterThan(0)
+      expect(plan.prefill.prefillMs).toBeCloseTo(1.8 * plan.prefill.serviceMs, 6)
+      expect(plan.decode.decodeMs).toBeCloseTo(256 * plan.decode.tpotMs, 6)
+    })
+
+    it('steady state is self-consistent: pool decode throughput equals the arriving token rate, per-GPU rate is in the published 70B-on-H100 band', () => {
+      const plan = planLlmd(m70, q, workload, pool('h100-sxm', 2), pool('h100-sxm', 2))
+      const arriving = workload.requestRate * workload.outputTokens
+      expect(plan.decode.tokensPerSecondPerPod * plan.decode.pods).toBeCloseTo(arriving, 4)
+      // ~390 tok/s/GPU — consistent with real-world bf16 70B H100 serving rates.
+      expect(plan.decode.tokensPerSecondPerGpu).toBeGreaterThan(300)
+      expect(plan.decode.tokensPerSecondPerGpu).toBeLessThan(500)
+    })
+
+    it('an unreachable TPOT SLO is reported infeasible, not silently sized', () => {
+      const plan = planLlmd(m70, q, { ...workload, tpotSloMs: 5 }, pool('h100-sxm', 2), pool('h100-sxm', 2))
+      expect(plan.feasible).toBe(false)
+      expect(plan.decode.pods).toBe(0)
+      expect(plan.warnings.some((w) => w.includes('TPOT SLO unreachable'))).toBe(true)
+    })
+
+    it('an unreachable TTFT SLO (prefill alone exceeds it) is reported infeasible', () => {
+      const plan = planLlmd(
+        model('Llama 3.1 405B'),
+        q,
+        { ...workload, inputTokens: 131072 },
+        pool('h100-sxm', 8),
+        pool('h100-sxm', 8),
+      )
+      expect(plan.feasible).toBe(false)
+      expect(plan.warnings.some((w) => w.includes('TTFT SLO unreachable'))).toBe(true)
+    })
+
+    it('decode pods whose weights leave no KV room are reported infeasible', () => {
+      const plan = planLlmd(model('Llama 3.1 405B'), q, workload, pool('h100-sxm', 8), pool('h100-sxm', 1))
+      expect(plan.feasible).toBe(false)
+      expect(plan.warnings.some((w) => w.includes('no KV-cache room'))).toBe(true)
+    })
+
+    it('zero request rate degenerates to one idle pod per pool', () => {
+      const plan = planLlmd(m70, q, { ...workload, requestRate: 0 }, pool('h100-sxm', 2), pool('h100-sxm', 2))
+      expect(plan.prefill.pods).toBe(1)
+      expect(plan.decode.pods).toBe(1)
+      expect(plan.decode.numRunningReqs).toBeCloseTo(0, 6)
+      expect(plan.prefill.queueMs).toBe(0)
+    })
+
+    it('DeepSeek-V3 demo: MoE active params + MLA KV make an fp8 H200 fleet dramatically smaller than dense-671B physics would suggest', () => {
+      const ds = model('DeepSeek-V3 / R1 671B (MoE, MLA)')
+      const dsWorkload: LlmdWorkload = {
+        requestRate: 20,
+        inputTokens: 2048,
+        outputTokens: 512,
+        ttftSloMs: 500,
+        tpotSloMs: 50,
+      }
+      const plan = planLlmd(ds, quantOf('fp8', 'fp8'), dsWorkload, pool('h200', 8), pool('h200', 8))
+      expect(plan.feasible).toBe(true)
+      expect(plan.prefill.pods).toBe(2)
+      // fp8 MLA KV is so small that one 8×H200 pod holds the whole decode load.
+      expect(plan.decode.pods).toBe(1)
+      expect(plan.decode.tpotMs).toBeLessThanOrEqual(50)
+      // MLA latent KV admits hundreds of concurrent sequences per pod.
+      expect(plan.decode.maxConcurrency).toBeGreaterThan(200)
+      expect(plan.decode.numRunningReqs).toBeGreaterThan(100)
+    })
   })
 })
 
