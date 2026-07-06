@@ -1,16 +1,22 @@
 # InferPlan — plan LLM deployments before you buy the GPUs
 
 Interactive calculators for sizing LLM deployments: how much GPU memory a
-model needs, which GPUs it fits on, and how far a given cluster can stretch.
-All calculation runs client-side; the site is a static build with no backend.
+model needs, which GPUs it fits on, how far a given cluster can stretch, and
+how many GPUs a request rate demands. All calculation runs client-side; the
+site is a static build with no backend.
 
-**Inference, training, and fine-tuning scenarios are live.** The engine and UI are
-structured so the remaining scenarios extend the same primitives rather than
-starting over.
+**Inference, training, fine-tuning, and llm-d fleet-sizing scenarios are
+live.** All four run on one audited engine: the same primitives that compute
+a KV cache also size a disaggregated fleet.
 
 Sister project: [InferLens](https://github.com/rabrooks/inferlens) —
 engine-neutral observability for inference engines. **InferPlan predicts what
-a deployment needs; InferLens shows what it actually did.**
+a deployment needs; InferLens shows what it actually did.** The two meet at
+llm-d: InferPlan sizes the prefill/decode pools and emits its predictions in
+the exact units InferLens records from each pool (predicted running
+requests, KV usage, phase timings), so a trace overlays a plan
+number-for-number — the shared contract is
+[docs/interop.md](docs/interop.md).
 
 ## Features
 
@@ -45,6 +51,14 @@ a deployment needs; InferLens shows what it actually did.**
   adapter-only gradients/optimizer states from rank × targeted projections,
   and the QLoRA dequant buffer — pinned to the LoRA and QLoRA papers'
   published numbers (65B on a single 48 GB GPU).
+- **llm-d fleet sizing** — given a request rate, token lengths, and TTFT/TPOT
+  SLOs, sizes the prefill pool (compute roofline + Erlang C queue wait) and
+  decode pool (bandwidth roofline + KV-capacity cap) of a disaggregated
+  deployment, for any model/GPU pairing in the database — including MoE
+  expert-coverage weight traffic and MLA latent KV, which shift both pool
+  sizes in ways nothing else computes. Efficiency assumptions (MFU, bandwidth
+  efficiency, KV-transfer β) are explicit knobs you can calibrate from a
+  measured trace.
 - **Shareable URLs** — the entire configuration (including imported custom
   models) is encoded in query params, so a config can be linked in an issue
   or a Slack thread.
@@ -70,11 +84,11 @@ independently and reusable outside the UI.
 | Inference, multi-GPU (TP/PP) | ✅ shipped |
 | Training (optimizer states, ZeRO/FSDP, activation checkpointing) | ✅ shipped |
 | Fine-tuning (full FT, LoRA, QLoRA) | ✅ shipped |
-| llm-d multi-pod capacity planning (disaggregated prefill/decode, request-rate-driven sizing) | planned — next |
+| llm-d multi-pod capacity planning (disaggregated prefill/decode, SLO-driven sizing) | ✅ shipped |
 
-Also planned: comparison mode (side-by-side configs), rough throughput and
-latency estimates from the recorded bandwidth/FLOPS, cloud cost estimates,
-and a custom-architecture editor.
+Also planned: comparison mode (side-by-side configs), P99 queue-wait
+refinement (v1 ships the M/M/c mean), an `@inferplan/engine` npm package,
+cloud cost estimates, and a custom-architecture editor.
 
 ## How InferPlan differs
 
@@ -95,16 +109,25 @@ sharding rules. InferPlan's lane:
   deployment of every GPU in the database.
 - **An auditable engine** — pure TypeScript, no backend, every formula pinned
   by a test against published numbers ([docs/FORMULAS.md](docs/FORMULAS.md)).
-- **Fleet sizing is coming** — disaggregated prefill/decode capacity planning
-  (the llm-d scenario) has essentially no tooling today; that's the road this
-  engine is built for.
+- **Fleet sizing to latency SLOs** — pre-deploy prefill/decode capacity
+  planning is a space with essentially no tooling (the research literature
+  itself notes the missing methodology); InferPlan sizes both pools of an
+  llm-d deployment to TTFT/TPOT targets from spec-sheet physics, with the
+  queueing term included and every heuristic exposed as a calibratable knob.
+- **A closed loop with observability** — predictions come out in the units a
+  live vLLM exposes, so an [InferLens](https://github.com/rabrooks/inferlens)
+  trace verifies a plan directly ([docs/interop.md](docs/interop.md)).
 
 ## How the numbers are computed
 
 See [docs/FORMULAS.md](docs/FORMULAS.md). Inference estimates target a
 vLLM-style serving engine at 90% memory utilization; training estimates
-follow transformer-math / Korthikanti et al. Activation peaks are explicit
-heuristics — treat totals as ±5% (inference) / ±10% (training). This is a
+follow transformer-math / Korthikanti et al.; llm-d fleet sizing is a
+first-principles roofline (prefill FLOPs/MFU, decode bytes/bandwidth,
+Erlang C queueing) pinned against measured prefill and decode numbers from
+Meta and the BentoML inference handbook. Activation peaks and efficiency
+factors are explicit heuristics — treat totals as ±5% (inference) / ±10%
+(training) and fleet sizes as a load-test starting point. This is a
 planning tool, not a benchmark.
 
 ## Contributing

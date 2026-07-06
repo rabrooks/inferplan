@@ -1,11 +1,12 @@
-# Memory formulas
+# Formulas
 
 Inference estimates model a vLLM-style serving engine; training estimates
-model a DeepSpeed/FSDP-style data-parallel run. Symbols: `P` total params,
-`L` layers, `H_kv` KV heads, `d_h` head dim, `T` total tokens in KV cache
-(context length × concurrent sequences), `tp`/`pp` tensor/pipeline degree,
-`N` data-parallel world size, `s` sequence length, `b` micro-batch size,
-`h` hidden size, `a` attention heads.
+model a DeepSpeed/FSDP-style data-parallel run; llm-d capacity planning
+models a disaggregated prefill/decode deployment. Symbols: `P` total params,
+`P_act` active params per token, `L` layers, `H_kv` KV heads, `d_h` head
+dim, `T` total tokens in KV cache (context length × concurrent sequences),
+`tp`/`pp` tensor/pipeline degree, `N` data-parallel world size, `s` sequence
+length, `b` micro-batch size, `h` hidden size, `a` attention heads.
 
 ## Weights
 
@@ -162,6 +163,113 @@ Max context at a concurrency and max concurrency at a context length both
 derive from `max_tokens`. The "smallest deployment" search tries power-of-two
 GPU counts, preferring TP while attention heads divide evenly and pushing the
 remainder into PP.
+
+## llm-d capacity planning (disaggregated prefill/decode)
+
+Answers "how many GPUs does this request rate need, within these latency
+SLOs?" for a deployment split into a compute-bound **prefill pool** and a
+bandwidth-bound **decode pool** with KV transfer between them (the
+llm-d / [DistServe][distserve] / [Splitwise][splitwise] pattern). The model
+is a first-principles roofline that doubles as the latency model: the same
+physics yields throughput, TTFT, and TPOT for every GPU in the database
+from its spec-sheet bandwidth and TFLOPS. Workload symbols: `λ` requests/s,
+`T_in`/`T_out` mean input/output tokens per request.
+
+Every efficiency assumption is an explicit knob, not a baked-in constant,
+so a measured trace (e.g. from [InferLens](interop.md)) can replace each
+default with a value calibrated to your hardware.
+
+### Prefill pool — compute-bound, sized to the TTFT SLO
+
+```
+FLOPs/request = 2·P_act·T_in  +  2·T_in²·(a·d_h)·L
+t_prefill     = FLOPs / (pod_gpus × TFLOPS_bf16 × MFU)        MFU default 0.45
+TTFT          = W_queue + β·t_prefill                         β default 1.8
+```
+
+The `2·P_act·T` GEMM term is the Kaplan 2·FLOPs-per-weight rule (active
+params for MoE). The quadratic causal-attention term is **always included**
+— negligible at chat context, it is ~84% of total FLOPs for Llama3-405B at
+1M tokens, and it costs nothing to compute, so no crossover heuristic is
+needed. Pinned against Meta's measured 405B prefills (128K tokens ≈ 60 s on
+one 8×H100 host; 1M ≈ 77 s at their reported 63% utilization) from the
+context-parallelism paper ([arXiv:2411.01783][meta-cp]). MFU defaults to
+0.45 — the 0.4–0.5 band multiple sources report for dense H100-class
+prefill; 0.6+ appears only in attention-dominated extreme-long-context runs.
+
+`β` is the KV-transfer overhead of shipping the prefilled cache to the
+decode pool, published at 1.8–1.9× raw prefill time and strongly
+interconnect-dependent — a documented heuristic knob.
+
+`W_queue` is the Erlang C (M/M/c) mean wait with the pool's pods as
+servers: offered load `a = λ·t_prefill`, wait probability from the Erlang B
+recursion, `W_q = C(c,a)·t_prefill/(c−a)`. A service-time-only TTFT would
+be silently wrong at high utilization — queueing is not optional. The pool
+is the smallest pod count with utilization `ρ = a/c ≤ 0.85` (the queueing
+stability cap used across the field) *and* `TTFT ≤ SLO`. Mean wait is what
+ships today; a two-moment P99 approximation is on the backlog.
+
+### Decode pool — bandwidth-bound, sized to the TPOT SLO
+
+Each decode step streams the weight shard once per GPU plus every running
+sequence's KV shard; at batch `n` with mean cached context
+`T̄ = T_in + T_out/2` (requests in a continuously batched pod are uniformly
+spread through their generations):
+
+```
+t_step(n) = (weights_read(n)/gpu + n × kv_bytes(T̄)/gpu) / (BW × eff)
+TPOT      = t_step(n)                                    eff default 0.7
+```
+
+`eff` is the fraction of spec-sheet HBM bandwidth realized in practice
+(band 0.5–0.8). Weight traffic amortizes across the batch; KV traffic does
+not — attention stays memory-bound at any batch size
+([arXiv:2503.08311][mind-gap]). At n=1 with no KV this reduces to the
+familiar ceiling `tok/s = BW / weight_bytes`, pinned to the [BentoML
+handbook][bentoml]'s worked example (70B FP16 ≈ 140 GB on a 3.35 TB/s H100
+→ ~24 tok/s per sequence).
+
+`weights_read(n)`: dense models stream all weights every step. MoE models
+stream only the experts the batch routes to — expected distinct experts
+for `n` tokens choosing `k` of `E` is `E·(1−(1−k/E)^n)`, rescaled so batch
+1 reads exactly the active parameters and a full batch approaches the
+total. This is why batched MoE decode approaches dense-total bandwidth
+cost while batch-1 MoE decode is dramatically faster.
+
+Per-pod concurrency is capped by the TPOT SLO (largest `n` with
+`t_step(n) ≤ SLO`) **and** by KV capacity (the memory inverse solver at
+mean context `T̄`) — the UI reports which bound bites. The pod count is the
+smallest `p` whose steady-state batch — the Little's law fixed point
+`n = (λ/p)·T_out·t_step(n)` — stays under 0.85 of that cap. A warning
+flags very large batches where decode approaches the compute roofline and
+the bandwidth-only estimate turns optimistic.
+
+### Cross-checks and outputs
+
+The linear `t_step(n)` is the same shape as inference-fleet-sim's
+calibrated `t_iter(n) = W + H·n` ([arXiv:2603.16054][fleet-sim]); our
+physically derived W and H land within the same order of magnitude as
+their hand-calibrated H100 constants (derived H ≈ 0.8 ms/slot vs. their
+0.32 — their constants bake in unstated TP/quantization assumptions), and
+that agreement is enforced as a loose test, not imported as constants.
+Sizing to explicit TTFT/TPOT SLOs with a hard ρ cap follows the goodput
+methodology of [DistServe][distserve] and [arXiv:2508.01989][pd-slo].
+
+All predictions are emitted in the units stock vLLM exposes and InferLens
+records — predicted `num_running_reqs` per decode pod, `kv_cache_usage`
+fraction, queued/prefill/decode phase times — per [docs/interop.md](interop.md).
+
+Caveats: mean token counts stand in for full arrival/length distributions;
+M/M/c assumes exponential-ish service times (mean wait only); pod counts
+are a starting point for load testing, not a guarantee.
+
+[distserve]: https://arxiv.org/abs/2401.09670
+[splitwise]: https://arxiv.org/abs/2311.18677
+[meta-cp]: https://arxiv.org/abs/2411.01783
+[mind-gap]: https://arxiv.org/abs/2503.08311
+[fleet-sim]: https://arxiv.org/abs/2603.16054
+[pd-slo]: https://arxiv.org/abs/2508.01989
+[bentoml]: https://bentoml.com/llm/getting-started/choosing-the-right-gpu
 
 ## Parameter estimation (HF import)
 
